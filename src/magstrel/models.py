@@ -2,6 +2,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Literal
 
+WorkType = Literal["remote", "hybrid", "in-office"]
+
 
 @dataclass
 class Job:
@@ -17,7 +19,7 @@ class Job:
     published: datetime | None = None
     deadline: datetime | None = None
 
-    work_type: Literal["remote", "hybrid", "in-office"] | None = None
+    work_type: WorkType | None = None
     min_loe: int | None = None
     max_loe: int | None = None
     company_type: Literal["startup", "midsize", "bigtech"] | None = None
