@@ -44,6 +44,7 @@ class SearchQuery:
     location: str | None = None
     max_employees: int | None = None
     days: int | None = None
+    include_closed: bool = False
     limit: int = 30
 
 

@@ -9,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import partial
 from typing import get_args
 
-from magstrel import db, discover, yc
+from magstrel import db
 from magstrel.models import (
     Company,
     CompanyType,
@@ -18,7 +18,10 @@ from magstrel.models import (
     SearchQuery,
     WorkType,
 )
-from magstrel.sources import ashby, greenhouse, lever, yc_jobs
+from magstrel.sources.company import discover
+from magstrel.sources.company import yc as yc_companies
+from magstrel.sources.job import ashby, greenhouse, lever
+from magstrel.sources.job import yc as yc_jobs
 from magstrel.utils import age, cut, format_employees, parse_csv, parse_employees
 
 SOURCES = {
@@ -99,6 +102,9 @@ def main() -> None:
     search.add_argument("--location", help="location contains, e.g. london")
     search.add_argument("--max-employees", type=int)
     search.add_argument("--days", type=int, help="posted in the last N days")
+    search.add_argument(
+        "--closed", action="store_true", help="also show jobs that are no longer posted"
+    )
     search.add_argument("--limit", type=int, default=30)
     search.set_defaults(run=cmd_search)
 
@@ -134,16 +140,12 @@ def cmd_scrape(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
         targets = [t for t in targets if t.ats == args.only]
     if not targets:
         sys.exit("nothing to scrape, add companies with: magstrel company add ...")
-    # yc is throttled to one request a second: do the fast sources first
     targets.sort(key=lambda t: t.ats == "yc")
 
-    # yc isn't a real ats (not offered in `company add --ats`), so it's only added here,
-    # with the ids we already have so it can skip re-downloading their descriptions
     sources = SOURCES | {
         "yc": partial(yc_jobs.fetch, known_ids=db.known_external_ids(conn, "yc"))
     }
 
-    # downloads run in parallel threads; database writes stay on this main thread
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         futures = {pool.submit(_fetch, target, sources): target for target in targets}
         for future in as_completed(futures):
@@ -153,9 +155,10 @@ def cmd_scrape(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
             except Exception as err:  # noqa: BLE001
                 print(f"{target.name}: FAILED ({err})")
                 continue
-            new = db.save_jobs(conn, target.company_id, jobs)
-            print(f"{target.name}: {len(jobs)} fetched, {new} new")
-    print(f"total in database: {db.count_jobs(conn)}")
+            new, closed = db.save_jobs(conn, target.company_id, jobs)
+            print(f"{target.name}: {len(jobs)} fetched, {new} new, {closed} closed")
+    open_jobs, closed_jobs = db.count_jobs(conn)
+    print(f"database: {open_jobs} open jobs, {closed_jobs} closed")
 
 
 def _fetch(
@@ -205,7 +208,7 @@ def cmd_company_import_yc(conn: sqlite3.Connection, args: argparse.Namespace) ->
     print("downloading YC company list...")
     existing = {c.name.lower(): c for c in db.list_companies(conn)}
     added = updated = 0
-    for company in yc.fetch_companies(include_all=args.all):
+    for company in yc_companies.fetch_companies(include_all=args.all):
         current = existing.get(company.name.lower())
         if current is None:
             company.id = db.add_company(conn, company)
@@ -270,6 +273,7 @@ def cmd_search(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
         location=args.location,
         max_employees=args.max_employees,
         days=args.days,
+        include_closed=args.closed,
         limit=args.limit,
     )
     try:
@@ -308,6 +312,22 @@ def cmd_show(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
     print(f"about {job['company_name']}: {job['company_description'] or '-'}")
     print(f"  {job['company_type'] or '?'} | {employees} | {job['website'] or '-'}")
     print(f"  tags: {', '.join(json.loads(job['tags'])) or '-'}")
+    if job["closed_at"]:
+        print(f"\nCLOSED: no longer posted since {age(job['closed_at'])} ago")
+    extras = [
+        f"{label}: {job[key]}"
+        for label, key in (("salary", "salary"), ("equity", "equity"), ("visa", "visa"))
+        if job[key]
+    ]
+    if job["min_loe"] is not None:
+        extras.append(f"experience: {job['min_loe']}+ years")
+    if extras:
+        print("\n" + " | ".join(extras))
+    contacts = json.loads(job["recruiter_detail"])
+    if contacts:
+        print("\ncontacts:")
+        for who, link in contacts.items():
+            print(f"  {who}: {link or '-'}")
     print()
     print(job["description"] or "(no description)")
 

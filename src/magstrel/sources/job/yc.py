@@ -1,3 +1,4 @@
+import html
 import json
 import re
 import threading
@@ -29,15 +30,29 @@ def fetch(
     board: str, company: str, known_ids: frozenset[str] = frozenset()
 ) -> list[Job]:
     props = _page_props(f"{BASE_URL}/companies/{board}/jobs")
+    contacts = _founder_contacts(props.get("company") or {})
     jobs = []
     for raw in props["jobPostings"]:
         external_id = str(raw["id"])
         description = "" if external_id in known_ids else _description(raw["url"])
-        jobs.append(_to_job(raw, company, description))
+        jobs.append(_to_job(raw, company, description, contacts))
     return jobs
 
 
-def _to_job(raw: dict, company: str, description: str) -> Job:
+def _founder_contacts(company: dict) -> dict[str, str]:
+    # {"Sean OBrien (CEO)": "https://linkedin.com/in/..."}; at YC startups founders usually hire
+    contacts = {}
+    for founder in company.get("founders") or []:
+        if not founder.get("is_active", True) or not founder.get("full_name"):
+            continue
+        who = founder["full_name"]
+        if founder.get("title"):
+            who += f" ({founder['title']})"
+        contacts[who] = founder.get("linkedin_url") or founder.get("twitter_url") or ""
+    return contacts
+
+
+def _to_job(raw: dict, company: str, description: str, contacts: dict[str, str]) -> Job:
     location = raw.get("location") or ""
     return Job(
         raw=raw,
@@ -58,12 +73,13 @@ def _to_job(raw: dict, company: str, description: str) -> Job:
         salary=raw.get("salaryRange") or None,
         equity=raw.get("equityRange") or None,
         visa=raw.get("visa") or None,
+        recruiter_detail=contacts,
     )
 
 
 def _description(path: str) -> str:
     try:
-        return _page_props(BASE_URL + path)["job"].get("description") or ""
+        return html.unescape(_page_props(BASE_URL + path)["job"].get("description") or "")
     except urllib.error.URLError, TimeoutError, ValueError, KeyError:
         return ""
 

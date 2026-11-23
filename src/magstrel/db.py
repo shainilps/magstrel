@@ -13,11 +13,11 @@ UPSERT = """
 INSERT INTO jobs (
     company_id, source, external_id, company, role, location, official_posting_url,
     description, published, deadline, work_type, min_loe, skills,
-    salary, equity, visa, raw, first_seen, last_seen
+    salary, equity, visa, recruiter_detail, raw, first_seen, last_seen
 ) VALUES (
     :company_id, :source, :external_id, :company, :role, :location, :official_posting_url,
     :description, :published, :deadline, :work_type, :min_loe, :skills,
-    :salary, :equity, :visa, :raw, :now, :now
+    :salary, :equity, :visa, :recruiter_detail, :raw, :now, :now
 )
 ON CONFLICT (source, external_id) DO UPDATE SET
     company_id           = excluded.company_id,
@@ -34,8 +34,11 @@ ON CONFLICT (source, external_id) DO UPDATE SET
     salary               = excluded.salary,
     equity               = excluded.equity,
     visa                 = excluded.visa,
+    recruiter_detail     = CASE WHEN excluded.recruiter_detail <> '{}'
+                                THEN excluded.recruiter_detail ELSE jobs.recruiter_detail END,
     raw                  = excluded.raw,
-    last_seen            = excluded.last_seen
+    last_seen            = excluded.last_seen,
+    closed_at            = NULL
 RETURNING first_seen = last_seen AS is_new
 """
 
@@ -179,14 +182,23 @@ def _to_company(row: sqlite3.Row) -> Company:
 # ---- jobs ----
 
 
-def save_jobs(conn: sqlite3.Connection, company_id: int, jobs: list[Job]) -> int:
+def save_jobs(
+    conn: sqlite3.Connection, company_id: int, jobs: list[Job]
+) -> tuple[int, int]:
+    # returns (new jobs, jobs closed because this scrape no longer lists them)
     now = datetime.now(UTC).isoformat()
     new = 0
     with conn:
         for job in jobs:
             row = conn.execute(UPSERT, _to_row(job, company_id, now)).fetchone()
             new += row["is_new"]
-    return new
+        # every job this scrape returned now has last_seen = now; anything older is gone
+        closed = conn.execute(
+            "UPDATE jobs SET closed_at = ?"
+            " WHERE company_id = ? AND last_seen < ? AND closed_at IS NULL",
+            (now, company_id, now),
+        ).rowcount
+    return new, closed
 
 
 def known_external_ids(conn: sqlite3.Connection, source: str) -> frozenset[str]:
@@ -196,8 +208,11 @@ def known_external_ids(conn: sqlite3.Connection, source: str) -> frozenset[str]:
     return frozenset(row["external_id"] for row in rows)
 
 
-def count_jobs(conn: sqlite3.Connection) -> int:
-    return conn.execute("SELECT COUNT(*) AS total FROM jobs").fetchone()["total"]
+def count_jobs(conn: sqlite3.Connection) -> tuple[int, int]:
+    row = conn.execute(
+        "SELECT COUNT(*) - COUNT(closed_at) AS open, COUNT(closed_at) AS closed FROM jobs"
+    ).fetchone()
+    return row["open"], row["closed"]
 
 
 # ---- search ----
@@ -228,6 +243,8 @@ def search_jobs(conn: sqlite3.Connection, query: SearchQuery) -> list[sqlite3.Ro
     if query.max_employees is not None:
         where.append("c.employees_max <= ?")
         params.append(query.max_employees)
+    if not query.include_closed:
+        where.append("j.closed_at IS NULL")
     if query.days is not None:
         since = datetime.now(UTC) - timedelta(days=query.days)
         where.append("COALESCE(j.published, j.first_seen) >= ?")
@@ -288,6 +305,7 @@ def _to_row(job: Job, company_id: int, now: str) -> dict:
         "salary": job.salary,
         "equity": job.equity,
         "visa": job.visa,
+        "recruiter_detail": json.dumps(job.recruiter_detail),
         "raw": json.dumps(job.raw),
         "now": now,
     }
