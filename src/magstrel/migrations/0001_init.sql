@@ -1,5 +1,24 @@
-CREATE TABLE IF NOT EXISTS jobs (
+CREATE TABLE companies (
     id                   INTEGER PRIMARY KEY,
+    name                 TEXT NOT NULL UNIQUE,
+    career_site          TEXT,
+    description          TEXT NOT NULL DEFAULT '',
+    tags                 TEXT NOT NULL DEFAULT '[]',
+    employees_min        INTEGER,
+    employees_max        INTEGER,
+    company_type         TEXT,
+
+    ats                  TEXT,
+    board                TEXT,
+
+    added_at             TEXT NOT NULL,
+
+    UNIQUE (ats, board)
+);
+
+CREATE TABLE jobs (
+    id                   INTEGER PRIMARY KEY,
+    company_id           INTEGER NOT NULL REFERENCES companies (id) ON DELETE CASCADE,
     source               TEXT NOT NULL,
     external_id          TEXT NOT NULL,
     company              TEXT NOT NULL,
@@ -13,9 +32,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     work_type            TEXT,
     min_loe              INTEGER,
     max_loe              INTEGER,
-    company_type         TEXT,
     skills               TEXT NOT NULL DEFAULT '[]',
-    meta                 TEXT NOT NULL DEFAULT '[]',
     recruiter_detail     TEXT NOT NULL DEFAULT '{}',
 
     raw                  TEXT NOT NULL,
@@ -25,3 +42,5 @@ CREATE TABLE IF NOT EXISTS jobs (
 
     UNIQUE (source, external_id)
 );
+
+CREATE INDEX jobs_company_id ON jobs (company_id);
