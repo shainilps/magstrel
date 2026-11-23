@@ -1,17 +1,29 @@
 import argparse
+import json
+import shutil
 import sqlite3
 import sys
+import webbrowser
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import get_args
 
-from magstrel import db
-from magstrel.models import Company, CompanyType
-from magstrel.sources import greenhouse, lever
-from magstrel.utils import parse_csv, parse_employees
+from magstrel import db, discover, yc
+from magstrel.models import (
+    Company,
+    CompanyType,
+    Job,
+    ScrapeTarget,
+    SearchQuery,
+    WorkType,
+)
+from magstrel.sources import ashby, greenhouse, lever
+from magstrel.utils import age, cut, format_employees, parse_csv, parse_employees
 
 # ats name -> that source's fetch function
 SOURCES = {
     "greenhouse": greenhouse.fetch,
     "lever": lever.fetch,
+    "ashby": ashby.fetch,
 }
 
 
@@ -24,9 +36,9 @@ def main() -> None:
     commands.add_parser(
         "migrate", help="apply pending database migrations"
     ).set_defaults(run=cmd_migrate)
-    commands.add_parser(
-        "scrape", help="fetch jobs from every scrapable company"
-    ).set_defaults(run=cmd_scrape)
+    scrape = commands.add_parser("scrape", help="fetch jobs from every scrapable company")
+    scrape.add_argument("--workers", type=int, default=8, help="parallel downloads")
+    scrape.set_defaults(run=cmd_scrape)
 
     company = commands.add_parser("company", help="manage companies")
     company_commands = company.add_subparsers(dest="company_command", required=True)
@@ -35,6 +47,7 @@ def main() -> None:
     add.add_argument("name")
     add.add_argument("--ats", choices=SOURCES, help="job board system it uses")
     add.add_argument("--board", help="its board name on that ats, e.g. stripe")
+    add.add_argument("--website", help="its homepage")
     add.add_argument("--career-site", help="url of its careers page")
     add.add_argument("--description", default="")
     add.add_argument(
@@ -47,6 +60,41 @@ def main() -> None:
     company_commands.add_parser("list", help="list companies").set_defaults(
         run=cmd_company_list
     )
+
+    import_yc = company_commands.add_parser(
+        "import-yc", help="import Y Combinator companies (active + hiring by default)"
+    )
+    import_yc.add_argument("--all", action="store_true", help="every YC company")
+    import_yc.set_defaults(run=cmd_company_import_yc)
+
+    find = company_commands.add_parser(
+        "discover", help="find the ats + board for companies that don't have one"
+    )
+    find.add_argument("--limit", type=int, help="only try this many companies")
+    find.add_argument("--workers", type=int, default=8, help="parallel lookups")
+    find.set_defaults(run=cmd_company_discover)
+
+    search = commands.add_parser("search", help="search jobs")
+    search.add_argument("terms", nargs="*", help="words to search for, e.g. rust backend")
+    search.add_argument("--raw", action="store_true", help="use FTS5 syntax: OR, NOT, role:rust ...")
+    search.add_argument("--remote", action="store_const", const="remote", dest="work_type")
+    search.add_argument("--work-type", choices=get_args(WorkType))
+    search.add_argument("--type", choices=get_args(CompanyType), dest="company_type")
+    search.add_argument("--tag", help="company tag, e.g. fintech or yc-backed")
+    search.add_argument("--company", help="company name contains")
+    search.add_argument("--location", help="location contains, e.g. london")
+    search.add_argument("--max-employees", type=int)
+    search.add_argument("--days", type=int, help="posted in the last N days")
+    search.add_argument("--limit", type=int, default=30)
+    search.set_defaults(run=cmd_search)
+
+    show = commands.add_parser("show", help="show one job in full")
+    show.add_argument("id", type=int)
+    show.set_defaults(run=cmd_show)
+
+    open_ = commands.add_parser("open", help="open a job posting in your browser")
+    open_.add_argument("id", type=int)
+    open_.set_defaults(run=cmd_open)
 
     args = parser.parse_args()
     conn = db.connect()
@@ -71,19 +119,26 @@ def cmd_scrape(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
     if not targets:
         sys.exit("no scrapable companies yet, add one with: magstrel company add ...")
 
-    for target in targets:
-        fetch = SOURCES.get(target.ats)
-        if fetch is None:
-            print(f"{target.name}: SKIPPED (unknown ats {target.ats!r})")
-            continue
-        try:
-            jobs = fetch(target.board, target.name)
-        except Exception as err:  # noqa: BLE001
-            print(f"{target.name}: FAILED ({err})")
-            continue
-        new = db.save_jobs(conn, target.company_id, jobs)
-        print(f"{target.name}: {len(jobs)} fetched, {new} new")
+    # downloads run in parallel threads; database writes stay on this main thread
+    with ThreadPoolExecutor(max_workers=args.workers) as pool:
+        futures = {pool.submit(_fetch, target): target for target in targets}
+        for future in as_completed(futures):
+            target = futures[future]
+            try:
+                jobs = future.result()
+            except Exception as err:  # noqa: BLE001
+                print(f"{target.name}: FAILED ({err})")
+                continue
+            new = db.save_jobs(conn, target.company_id, jobs)
+            print(f"{target.name}: {len(jobs)} fetched, {new} new")
     print(f"total in database: {db.count_jobs(conn)}")
+
+
+def _fetch(target: ScrapeTarget) -> list[Job]:
+    fetch = SOURCES.get(target.ats)
+    if fetch is None:
+        raise ValueError(f"unknown ats {target.ats!r}")
+    return fetch(target.board, target.name)
 
 
 def cmd_company_add(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
@@ -98,6 +153,7 @@ def cmd_company_add(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
         name=args.name,
         ats=args.ats,
         board=args.board,
+        website=args.website,
         career_site=args.career_site,
         description=args.description,
         tags=parse_csv(args.tags),
@@ -117,4 +173,118 @@ def cmd_company_list(conn: sqlite3.Connection, args: argparse.Namespace) -> None
         board = f"{c.ats}/{c.board}" if c.ats else "-"
         tags = ",".join(c.tags) or "-"
         print(f"{c.id:>4}  {c.name:<20} {board:<24} {tags}")
+
+
+
+def cmd_company_import_yc(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
+    print("downloading YC company list...")
+    existing = {c.name.lower(): c for c in db.list_companies(conn)}
+    added = updated = 0
+    for company in yc.fetch_companies(include_all=args.all):
+        current = existing.get(company.name.lower())
+        if current is None:
+            company.id = db.add_company(conn, company)
+            existing[company.name.lower()] = company
+            added += 1
+        else:
+            _fill_missing(current, company)
+            db.update_company(conn, current)
+            updated += 1
+    print(f"added {added} companies, updated {updated} existing ones")
+
+
+def _fill_missing(current: Company, new: Company) -> None:
+    # never overwrite what you already set; only fill gaps and add tags
+    current.website = current.website or new.website
+    current.description = current.description or new.description
+    current.employees_min = current.employees_min or new.employees_min
+    current.employees_max = current.employees_max or new.employees_max
+    current.company_type = current.company_type or new.company_type
+    current.tags += [t for t in new.tags if t not in current.tags]
+
+
+def cmd_company_discover(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
+    todo = [c for c in db.list_companies(conn) if c.ats is None]
+    if args.limit:
+        todo = todo[: args.limit]
+    print(f"looking up {len(todo)} companies...")
+
+    found = 0
+    with ThreadPoolExecutor(max_workers=args.workers) as pool:
+        futures = {pool.submit(discover.find_board, c.name, c.website): c for c in todo}
+        for future in as_completed(futures):
+            company = futures[future]
+            try:
+                result = future.result()
+            except Exception as err:  # noqa: BLE001
+                print(f"{company.name}: ERROR ({err})")
+                continue
+            if result is None:
+                continue
+            company.ats, company.board = result
+            try:
+                db.update_company(conn, company)
+            except sqlite3.IntegrityError:
+                print(f"{company.name}: {company.ats}/{company.board} already belongs to another company")
+                continue
+            found += 1
+            print(f"{company.name}: {company.ats}/{company.board}")
+    print(f"found {found} of {len(todo)}")
+
+
+def cmd_search(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
+    query = SearchQuery(
+        terms=args.terms,
+        raw=args.raw,
+        work_type=args.work_type,
+        company_type=args.company_type,
+        tag=args.tag,
+        company=args.company,
+        location=args.location,
+        max_employees=args.max_employees,
+        days=args.days,
+        limit=args.limit,
+    )
+    try:
+        rows = db.search_jobs(conn, query)
+    except sqlite3.OperationalError as err:
+        sys.exit(f"bad search: {err}")
+    if not rows:
+        print("no jobs found")
+        return
+
+    width = shutil.get_terminal_size().columns
+    role_width = max(20, width - 6 - 5 - 18 - 22 - 10 - 5)
+    for row in rows:
+        posted = age(row["published"] or row["first_seen"])
+        print(
+            f"{row['id']:>6} {posted:>4}  {cut(row['company'], 18):<18} "
+            f"{cut(row['role'], role_width):<{role_width}} "
+            f"{cut(row['location'], 22):<22} {row['work_type'] or '':<9}"
+        )
+    print(f"\n{len(rows)} jobs (magstrel show <id> for details)")
+
+
+def cmd_show(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
+    job = db.get_job(conn, args.id)
+    if job is None:
+        sys.exit(f"no job with id {args.id}")
+    employees = format_employees(job["employees_min"], job["employees_max"])
+    print(f"{job['role']}")
+    print(f"{job['company_name']} | {job['location']} | {job['work_type'] or 'work type unknown'}")
+    print(f"posted {age(job['published'] or job['first_seen'])} ago | {job['official_posting_url']}")
+    print()
+    print(f"about {job['company_name']}: {job['company_description'] or '-'}")
+    print(f"  {job['company_type'] or '?'} | {employees} | {job['website'] or '-'}")
+    print(f"  tags: {', '.join(json.loads(job['tags'])) or '-'}")
+    print()
+    print(job["description"] or "(no description)")
+
+
+def cmd_open(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
+    job = db.get_job(conn, args.id)
+    if job is None:
+        sys.exit(f"no job with id {args.id}")
+    webbrowser.open(job["official_posting_url"])
+    print(f"opened {job['official_posting_url']}")
 

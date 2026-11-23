@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import UTC, datetime
 
 
 def parse_employees(text: str | None) -> tuple[int | None, int | None]:
@@ -21,3 +21,30 @@ def parse_csv(text: str) -> list[str]:
 
 def to_iso(dt: datetime | None) -> str | None:
     return dt.isoformat() if dt else None
+
+
+def age(iso: str | None) -> str:
+    if not iso:
+        return "?"
+    seconds = (datetime.now(UTC) - datetime.fromisoformat(iso)).total_seconds()
+    if seconds < 3600:
+        return f"{int(seconds // 60)}m"
+    if seconds < 86400:
+        return f"{int(seconds // 3600)}h"
+    if seconds < 86400 * 365:
+        return f"{int(seconds // 86400)}d"
+    return f"{int(seconds // (86400 * 365))}y"
+
+
+def format_employees(low: int | None, high: int | None) -> str:
+    if low is None and high is None:
+        return "size unknown"
+    if low == high:
+        return f"{low} employees"
+    if high is None:
+        return f"{low}+ employees"
+    return f"{low}-{high} employees"
+
+
+def cut(text: str, width: int) -> str:
+    return text if len(text) <= width else text[: width - 1] + "…"

@@ -1,6 +1,7 @@
 CREATE TABLE companies (
     id                   INTEGER PRIMARY KEY,
     name                 TEXT NOT NULL UNIQUE,
+    website              TEXT,
     career_site          TEXT,
     description          TEXT NOT NULL DEFAULT '',
     tags                 TEXT NOT NULL DEFAULT '[]',

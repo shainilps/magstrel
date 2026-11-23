@@ -1,10 +1,10 @@
 import json
 import re
 import sqlite3
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from magstrel.models import Company, Job, ScrapeTarget
+from magstrel.models import Company, Job, ScrapeTarget, SearchQuery
 from magstrel.utils import to_iso
 
 MIGRATIONS_DIR = Path(__file__).parent / "migrations"
@@ -80,14 +80,15 @@ def add_company(conn: sqlite3.Connection, company: Company) -> int:
         cur = conn.execute(
             """
             INSERT INTO companies (
-                name, ats, board, career_site, description, tags,
+                name, ats, board, website, career_site, description, tags,
                 employees_min, employees_max, company_type, added_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 company.name,
                 company.ats,
                 company.board,
+                company.website,
                 company.career_site,
                 company.description,
                 json.dumps(company.tags),
@@ -100,6 +101,33 @@ def add_company(conn: sqlite3.Connection, company: Company) -> int:
     company_id = cur.lastrowid
     assert company_id is not None
     return company_id
+
+
+def update_company(conn: sqlite3.Connection, company: Company) -> None:
+    assert company.id is not None
+    with conn:
+        conn.execute(
+            """
+            UPDATE companies SET
+                name = ?, ats = ?, board = ?, website = ?, career_site = ?,
+                description = ?, tags = ?, employees_min = ?, employees_max = ?,
+                company_type = ?
+            WHERE id = ?
+            """,
+            (
+                company.name,
+                company.ats,
+                company.board,
+                company.website,
+                company.career_site,
+                company.description,
+                json.dumps(company.tags),
+                company.employees_min,
+                company.employees_max,
+                company.company_type,
+                company.id,
+            ),
+        )
 
 
 def list_companies(conn: sqlite3.Connection) -> list[Company]:
@@ -123,6 +151,7 @@ def _to_company(row: sqlite3.Row) -> Company:
         name=row["name"],
         ats=row["ats"],
         board=row["board"],
+        website=row["website"],
         career_site=row["career_site"],
         description=row["description"],
         tags=json.loads(row["tags"]),
@@ -148,6 +177,78 @@ def save_jobs(conn: sqlite3.Connection, company_id: int, jobs: list[Job]) -> int
 def count_jobs(conn: sqlite3.Connection) -> int:
     return conn.execute("SELECT COUNT(*) AS total FROM jobs").fetchone()["total"]
 
+
+
+# ---- search ----
+
+
+def search_jobs(conn: sqlite3.Connection, query: SearchQuery) -> list[sqlite3.Row]:
+    where: list[str] = []
+    params: list[object] = []
+
+    if query.terms:
+        where.append("jobs_fts MATCH ?")
+        params.append(" ".join(query.terms) if query.raw else _fts_quote(query.terms))
+    if query.work_type:
+        where.append("j.work_type = ?")
+        params.append(query.work_type)
+    if query.company_type:
+        where.append("c.company_type = ?")
+        params.append(query.company_type)
+    if query.tag:
+        where.append("EXISTS (SELECT 1 FROM json_each(c.tags) WHERE value = ?)")
+        params.append(query.tag)
+    if query.company:
+        where.append("c.name LIKE ?")
+        params.append(f"%{query.company}%")
+    if query.location:
+        where.append("j.location LIKE ?")
+        params.append(f"%{query.location}%")
+    if query.max_employees is not None:
+        where.append("c.employees_max <= ?")
+        params.append(query.max_employees)
+    if query.days is not None:
+        since = datetime.now(UTC) - timedelta(days=query.days)
+        where.append("COALESCE(j.published, j.first_seen) >= ?")
+        params.append(since.isoformat())
+
+    sql = """
+        SELECT j.id, j.role, j.location, j.work_type, j.published, j.first_seen,
+               c.name AS company
+        FROM jobs j
+        JOIN companies c ON c.id = j.company_id
+    """
+    if query.terms:
+        sql += " JOIN jobs_fts ON jobs_fts.rowid = j.id"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    if query.terms:
+        # bm25 = relevance score (lower is better); weights: role, company, location, description
+        sql += " ORDER BY bm25(jobs_fts, 10.0, 5.0, 2.0, 1.0)"
+    else:
+        sql += " ORDER BY COALESCE(j.published, j.first_seen) DESC"
+    sql += " LIMIT ?"
+    params.append(query.limit)
+
+    return conn.execute(sql, params).fetchall()
+
+
+def get_job(conn: sqlite3.Connection, job_id: int) -> sqlite3.Row | None:
+    return conn.execute(
+        """
+        SELECT j.*, c.name AS company_name, c.website, c.description AS company_description,
+               c.tags, c.employees_min, c.employees_max, c.company_type
+        FROM jobs j
+        JOIN companies c ON c.id = j.company_id
+        WHERE j.id = ?
+        """,
+        (job_id,),
+    ).fetchone()
+
+
+def _fts_quote(terms: list[str]) -> str:
+    # wrap each word in quotes so "c++" or "node.js" can't break FTS syntax; words are AND-ed
+    return " ".join('"' + term.replace('"', "") + '"' for term in terms)
 
 def _to_row(job: Job, company_id: int, now: str) -> dict:
     return {

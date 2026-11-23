@@ -13,6 +13,7 @@ class Company:
     ats: str | None = None
     board: str | None = None
 
+    website: str | None = None
     career_site: str | None = None
     description: str = ""
     tags: list[str] = field(default_factory=list)
@@ -32,6 +33,20 @@ class ScrapeTarget:
 
 
 @dataclass
+class SearchQuery:
+    terms: list[str] = field(default_factory=list)
+    raw: bool = False
+    work_type: WorkType | None = None
+    company_type: CompanyType | None = None
+    tag: str | None = None
+    company: str | None = None
+    location: str | None = None
+    max_employees: int | None = None
+    days: int | None = None
+    limit: int = 30
+
+
+@dataclass
 class Job:
     raw: dict[str, Any] = field(repr=False, compare=False)
     source: str
@@ -41,7 +56,7 @@ class Job:
     location: str
     official_posting_url: str
 
-    description: str = ""
+    description: str = field(default="", repr=False)
     published: datetime | None = None
     deadline: datetime | None = None
 
@@ -49,5 +64,4 @@ class Job:
     min_loe: int | None = None
     max_loe: int | None = None
     skills: list[str] = field(default_factory=list)
-    # email, phone number, linkedin, or any other way to contact
     recruiter_detail: dict[str, str] = field(default_factory=dict)
