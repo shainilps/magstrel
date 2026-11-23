@@ -20,6 +20,7 @@ class Company:
     employees_min: int | None = None
     employees_max: int | None = None
     company_type: CompanyType | None = None
+    yc_slug: str | None = None
 
     id: int | None = None
 
@@ -65,3 +66,7 @@ class Job:
     max_loe: int | None = None
     skills: list[str] = field(default_factory=list)
     recruiter_detail: dict[str, str] = field(default_factory=dict)
+
+    salary: str | None = None
+    equity: str | None = None
+    visa: str | None = None

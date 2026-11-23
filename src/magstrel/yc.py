@@ -34,6 +34,7 @@ def _to_company(raw: dict) -> Company:
         employees_min=team_size,
         employees_max=team_size,
         company_type=_company_type(team_size),
+        yc_slug=raw.get("slug") or None,
     )
 
 

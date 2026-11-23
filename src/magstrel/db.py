@@ -12,10 +12,12 @@ MIGRATIONS_DIR = Path(__file__).parent / "migrations"
 UPSERT = """
 INSERT INTO jobs (
     company_id, source, external_id, company, role, location, official_posting_url,
-    description, published, deadline, work_type, raw, first_seen, last_seen
+    description, published, deadline, work_type, min_loe, skills,
+    salary, equity, visa, raw, first_seen, last_seen
 ) VALUES (
     :company_id, :source, :external_id, :company, :role, :location, :official_posting_url,
-    :description, :published, :deadline, :work_type, :raw, :now, :now
+    :description, :published, :deadline, :work_type, :min_loe, :skills,
+    :salary, :equity, :visa, :raw, :now, :now
 )
 ON CONFLICT (source, external_id) DO UPDATE SET
     company_id           = excluded.company_id,
@@ -23,10 +25,15 @@ ON CONFLICT (source, external_id) DO UPDATE SET
     role                 = excluded.role,
     location             = excluded.location,
     official_posting_url = excluded.official_posting_url,
-    description          = excluded.description,
+    description          = COALESCE(NULLIF(excluded.description, ''), jobs.description),
     published            = excluded.published,
     deadline             = excluded.deadline,
     work_type            = COALESCE(excluded.work_type, jobs.work_type),
+    min_loe              = COALESCE(excluded.min_loe, jobs.min_loe),
+    skills               = CASE WHEN excluded.skills <> '[]' THEN excluded.skills ELSE jobs.skills END,
+    salary               = excluded.salary,
+    equity               = excluded.equity,
+    visa                 = excluded.visa,
     raw                  = excluded.raw,
     last_seen            = excluded.last_seen
 RETURNING first_seen = last_seen AS is_new
@@ -81,8 +88,8 @@ def add_company(conn: sqlite3.Connection, company: Company) -> int:
             """
             INSERT INTO companies (
                 name, ats, board, website, career_site, description, tags,
-                employees_min, employees_max, company_type, added_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                employees_min, employees_max, company_type, yc_slug, added_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 company.name,
@@ -95,6 +102,7 @@ def add_company(conn: sqlite3.Connection, company: Company) -> int:
                 company.employees_min,
                 company.employees_max,
                 company.company_type,
+                company.yc_slug,
                 datetime.now(UTC).isoformat(),
             ),
         )
@@ -111,7 +119,7 @@ def update_company(conn: sqlite3.Connection, company: Company) -> None:
             UPDATE companies SET
                 name = ?, ats = ?, board = ?, website = ?, career_site = ?,
                 description = ?, tags = ?, employees_min = ?, employees_max = ?,
-                company_type = ?
+                company_type = ?, yc_slug = ?
             WHERE id = ?
             """,
             (
@@ -125,6 +133,7 @@ def update_company(conn: sqlite3.Connection, company: Company) -> None:
                 company.employees_min,
                 company.employees_max,
                 company.company_type,
+                company.yc_slug,
                 company.id,
             ),
         )
@@ -136,9 +145,14 @@ def list_companies(conn: sqlite3.Connection) -> list[Company]:
 
 
 def list_scrape_targets(conn: sqlite3.Connection) -> list[ScrapeTarget]:
+    # a real ats wins; companies without one fall back to their YC jobs page
     rows = conn.execute(
-        "SELECT id, name, ats, board FROM companies"
-        " WHERE ats IS NOT NULL AND board IS NOT NULL ORDER BY name"
+        """
+        SELECT id, name, COALESCE(ats, 'yc') AS ats, COALESCE(board, yc_slug) AS board
+        FROM companies
+        WHERE (ats IS NOT NULL AND board IS NOT NULL) OR yc_slug IS NOT NULL
+        ORDER BY name
+        """
     )
     return [
         ScrapeTarget(row["id"], row["name"], row["ats"], row["board"]) for row in rows
@@ -158,6 +172,7 @@ def _to_company(row: sqlite3.Row) -> Company:
         employees_min=row["employees_min"],
         employees_max=row["employees_max"],
         company_type=row["company_type"],
+        yc_slug=row["yc_slug"],
     )
 
 
@@ -174,9 +189,15 @@ def save_jobs(conn: sqlite3.Connection, company_id: int, jobs: list[Job]) -> int
     return new
 
 
+def known_external_ids(conn: sqlite3.Connection, source: str) -> frozenset[str]:
+    rows = conn.execute(
+        "SELECT external_id FROM jobs WHERE source = ? AND description <> ''", (source,)
+    )
+    return frozenset(row["external_id"] for row in rows)
+
+
 def count_jobs(conn: sqlite3.Connection) -> int:
     return conn.execute("SELECT COUNT(*) AS total FROM jobs").fetchone()["total"]
-
 
 
 # ---- search ----
@@ -223,7 +244,6 @@ def search_jobs(conn: sqlite3.Connection, query: SearchQuery) -> list[sqlite3.Ro
     if where:
         sql += " WHERE " + " AND ".join(where)
     if query.terms:
-        # bm25 = relevance score (lower is better); weights: role, company, location, description
         sql += " ORDER BY bm25(jobs_fts, 10.0, 5.0, 2.0, 1.0)"
     else:
         sql += " ORDER BY COALESCE(j.published, j.first_seen) DESC"
@@ -247,8 +267,8 @@ def get_job(conn: sqlite3.Connection, job_id: int) -> sqlite3.Row | None:
 
 
 def _fts_quote(terms: list[str]) -> str:
-    # wrap each word in quotes so "c++" or "node.js" can't break FTS syntax; words are AND-ed
     return " ".join('"' + term.replace('"', "") + '"' for term in terms)
+
 
 def _to_row(job: Job, company_id: int, now: str) -> dict:
     return {
@@ -263,6 +283,11 @@ def _to_row(job: Job, company_id: int, now: str) -> dict:
         "published": to_iso(job.published),
         "deadline": to_iso(job.deadline),
         "work_type": job.work_type,
+        "min_loe": job.min_loe,
+        "skills": json.dumps(job.skills),
+        "salary": job.salary,
+        "equity": job.equity,
+        "visa": job.visa,
         "raw": json.dumps(job.raw),
         "now": now,
     }
