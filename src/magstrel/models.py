@@ -1,10 +1,11 @@
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 
 
 @dataclass
 class Job:
+    raw: dict[str, Any] = field(repr=False, compare=False)
     source: str
     external_id: str
     company: str

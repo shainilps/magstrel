@@ -27,6 +27,7 @@ def fetch(board: str) -> list[Job]:
 def _to_job(raw: dict) -> Job:
     published = raw.get("first_published") or raw.get("updated_at")
     return Job(
+        raw=raw,
         source="greenhouse",
         external_id=str(raw["id"]),
         company=raw.get("company_name") or "",
