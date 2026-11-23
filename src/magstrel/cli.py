@@ -30,7 +30,7 @@ from magstrel.utils import (
 )
 from magstrel.web import app as web_app
 
-DEFAULT_EVERY = "6h"
+DEFAULT_EVERY = "24h"
 
 
 def main() -> None:

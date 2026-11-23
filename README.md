@@ -7,7 +7,7 @@ your own job database, scraped straight from company job boards.
 ```
 uv sync
 uv run magstrel migrate
-uv run magstrel up        # web + mcp + refresh every 6h, in the background
+uv run magstrel up        # web + mcp + refresh every 24h, in the background
 uv run magstrel status
 uv run magstrel down
 ```
