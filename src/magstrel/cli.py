@@ -1,39 +1,36 @@
 import argparse
 import json
+import logging
 import shutil
 import sqlite3
 import sys
 import webbrowser
-from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from functools import partial
+from datetime import UTC, datetime, timedelta
 from typing import get_args
 
 import uvicorn
 
-from magstrel import db, mcp_server
-from magstrel.enrich import rules
+from magstrel import daemon, db, mcp_server, refresh
 from magstrel.models import (
     Category,
     Company,
     CompanyType,
-    Job,
-    ScrapeTarget,
     SearchQuery,
     Seniority,
     WorkType,
 )
-from magstrel.sources.company import discover
-from magstrel.sources.company import yc as yc_companies
-from magstrel.sources.job import ashby, greenhouse, lever
-from magstrel.sources.job import yc as yc_jobs
-from magstrel.utils import age, cut, format_employees, parse_csv, parse_employees
+from magstrel.utils import (
+    age,
+    cut,
+    format_employees,
+    parse_csv,
+    parse_duration,
+    parse_employees,
+    until,
+)
+from magstrel.web import app as web_app
 
-SOURCES = {
-    "greenhouse": greenhouse.fetch,
-    "lever": lever.fetch,
-    "ashby": ashby.fetch,
-}
+DEFAULT_EVERY = "6h"
 
 
 def main() -> None:
@@ -41,6 +38,23 @@ def main() -> None:
         prog="magstrel", description="Your own job database."
     )
     commands = parser.add_subparsers(dest="command", required=True)
+
+    up = commands.add_parser(
+        "up", help="start web page + MCP + auto refresh in the background"
+    )
+    _server_options(up)
+    up.set_defaults(run=cmd_up)
+    commands.add_parser("down", help="stop the background server").set_defaults(
+        run=cmd_down
+    )
+    commands.add_parser(
+        "status", help="is it running, what is it doing, when did things last run"
+    ).set_defaults(run=cmd_status)
+    server = commands.add_parser(
+        "server", help="what `up` runs, but in the foreground (Ctrl+C to stop)"
+    )
+    _server_options(server)
+    server.set_defaults(run=cmd_server)
 
     commands.add_parser(
         "migrate", help="apply pending database migrations"
@@ -51,7 +65,7 @@ def main() -> None:
     scrape.add_argument("--workers", type=int, default=8, help="parallel downloads")
     scrape.add_argument(
         "--only",
-        choices=[*SOURCES, "yc"],
+        choices=[*refresh.SOURCES, "yc"],
         help="scrape just one source, e.g. --only yc",
     )
     scrape.set_defaults(run=cmd_scrape)
@@ -61,7 +75,7 @@ def main() -> None:
 
     add = company_commands.add_parser("add", help="add a company")
     add.add_argument("name")
-    add.add_argument("--ats", choices=SOURCES, help="job board system it uses")
+    add.add_argument("--ats", choices=refresh.SOURCES, help="job board system it uses")
     add.add_argument("--board", help="its board name on that ats, e.g. stripe")
     add.add_argument("--website", help="its homepage")
     add.add_argument("--career-site", help="url of its careers page")
@@ -88,12 +102,19 @@ def main() -> None:
     )
     find.add_argument("--limit", type=int, help="only try this many companies")
     find.add_argument("--workers", type=int, default=8, help="parallel lookups")
+    find.add_argument(
+        "--all",
+        action="store_true",
+        help="also recheck companies looked up in the last 30 days",
+    )
     find.set_defaults(run=cmd_company_discover)
 
     enrich = commands.add_parser(
         "enrich", help="work out seniority, category, skills, ... from each job's text"
     )
-    enrich.add_argument("--all", action="store_true", help="redo every job, not just new ones")
+    enrich.add_argument(
+        "--all", action="store_true", help="redo every job, not just new ones"
+    )
     enrich.set_defaults(run=cmd_enrich)
 
     search = commands.add_parser("search", help="search jobs")
@@ -126,13 +147,8 @@ def main() -> None:
     search.set_defaults(run=cmd_search)
 
     commands.add_parser(
-        "mcp", help="run the MCP server on stdio (started by Claude Code, not by hand)"
+        "mcp", help="MCP over stdio, for when `up` isn't running (Claude Code starts it)"
     ).set_defaults(run=cmd_mcp)
-
-    serve = commands.add_parser("serve", help="run the web page (default http://127.0.0.1:8000)")
-    serve.add_argument("--host", default="127.0.0.1", help="127.0.0.1 = only this computer")
-    serve.add_argument("--port", type=int, default=8000)
-    serve.set_defaults(run=cmd_serve)
 
     show = commands.add_parser("show", help="show one job in full")
     show.add_argument("id", type=int)
@@ -143,13 +159,146 @@ def main() -> None:
     open_.set_defaults(run=cmd_open)
 
     args = parser.parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     conn = db.connect()
     try:
-        if args.command != "migrate" and db.pending_migrations(conn):
+        if args.command not in ("migrate", "down") and db.pending_migrations(conn):
             sys.exit("database is out of date, run: magstrel migrate")
         args.run(conn, args)
     finally:
         conn.close()
+
+
+def _server_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--every", default=DEFAULT_EVERY, help="how often to refresh, e.g. 30m, 6h, 1d"
+    )
+    parser.add_argument(
+        "--no-refresh", action="store_true", help="web page + MCP only, no auto refresh"
+    )
+    parser.add_argument(
+        "--host", default="127.0.0.1", help="127.0.0.1 = only this computer"
+    )
+    parser.add_argument("--port", type=int, default=8000)
+
+
+def cmd_up(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
+    if pid := daemon.running_pid():
+        sys.exit(f"already running (pid {pid}), see: magstrel status")
+    _check_every(args.every)
+    url = f"http://{args.host}:{args.port}"
+    server_args = ["--every", args.every, "--host", args.host, "--port", str(args.port)]
+    if args.no_refresh:
+        server_args.append("--no-refresh")
+    try:
+        pid = daemon.start(server_args, url)
+    except RuntimeError as err:
+        sys.exit(str(err))
+    state = db.get_state(conn)
+    refresh_note = "off" if args.no_refresh else f"every {args.every}"
+    print(f"magstrel is up (pid {pid})")
+    print(f"  web page:  {url}")
+    print(f"  MCP:       {url}/mcp")
+    print(f"  refresh:   {refresh_note}")
+    print(f"  log:       {daemon.log_file()}")
+    print()
+    print("data:")
+    print(f"  last full refresh:  {_ago(state.get('last_run_finished_at'))}")
+    print(f"  jobs scraped:       {_ago(state.get('jobs_scraped_at'))}")
+    print(f"  companies imported: {_ago(state.get('companies_imported_at'))}")
+    open_jobs, _ = db.count_jobs(conn)
+    print(f"  open jobs:          {open_jobs:,}")
+    if not args.no_refresh and _is_stale(state.get("last_run_finished_at"), args.every):
+        print("  (a refresh is starting now in the background)")
+    print()
+    print("connect Claude Code (once):")
+    print(f"  claude mcp add --transport http --scope user magstrel {url}/mcp")
+    print()
+    print("see progress: magstrel status   ·   stop: magstrel down")
+
+
+def cmd_down(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
+    pid = daemon.stop()
+    print(f"stopped (pid {pid})" if pid else "not running")
+
+
+def cmd_server(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
+    every = None if args.no_refresh else _check_every(args.every)
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", force=True
+    )
+    db.set_state(
+        conn,
+        server_url=f"http://{args.host}:{args.port}",
+        refresh_every=None if every is None else args.every,
+    )
+    conn.close()
+    web_app.app.state.refresh_every = every
+    uvicorn.run(web_app.app, host=args.host, port=args.port)
+
+
+def cmd_status(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
+    state = db.get_state(conn)
+    pid = daemon.running_pid()
+    url = state.get("server_url", "?")
+
+    if pid:
+        print(f"running (pid {pid}) at {url}   ·   MCP: {url}/mcp")
+        if state.get("refresh_status") == "running":
+            started = age(state.get("last_run_started_at"))
+            print(f"now:           {state.get('current_step')}  (refresh started {started} ago)")
+        elif state.get("refresh_every"):
+            print(f"now:           idle, next refresh in {until(state.get('next_run_at'))}")
+        else:
+            print("now:           idle (auto refresh is off)")
+    else:
+        print("not running (start it with: magstrel up)")
+
+    finished = state.get("last_run_finished_at")
+    if finished:
+        took = _duration(state.get("last_run_started_at"), finished)
+        print(f"last refresh:  finished {age(finished)} ago, {state.get('last_run_result')}, took {took}")
+    else:
+        print("last refresh:  never")
+    print(
+        f"companies:     YC list imported {_ago(state.get('companies_imported_at'))}"
+        f" · job boards checked {_ago(state.get('boards_checked_at'))}"
+    )
+    print(
+        f"jobs:          scraped {_ago(state.get('jobs_scraped_at'))}"
+        f" · enriched {_ago(state.get('enriched_at'))}"
+    )
+    if state.get("refresh_every"):
+        print(f"schedule:      every {state['refresh_every']}")
+    open_jobs, closed_jobs = db.count_jobs(conn)
+    print(
+        f"database:      {open_jobs:,} open jobs, {closed_jobs:,} closed"
+        f" · {db.count_companies(conn):,} companies"
+    )
+
+
+def _is_stale(last: str | None, every: str) -> bool:
+    if last is None:
+        return True
+    return datetime.fromisoformat(last) + parse_duration(every) <= datetime.now(UTC)
+
+
+def _ago(iso: str | None) -> str:
+    return f"{age(iso)} ago" if iso else "never"
+
+
+def _duration(start: str | None, end: str) -> str:
+    if not start:
+        return "?"
+    seconds = (datetime.fromisoformat(end) - datetime.fromisoformat(start)).total_seconds()
+    return f"{int(seconds // 60)}m {int(seconds % 60)}s"
+
+
+def _check_every(text: str) -> timedelta:
+    try:
+        return parse_duration(text)
+    except ValueError as err:
+        sys.exit(str(err))
 
 
 def cmd_migrate(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
@@ -161,39 +310,22 @@ def cmd_migrate(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
 
 
 def cmd_scrape(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
-    targets = db.list_scrape_targets(conn)
-    if args.only:
-        targets = [t for t in targets if t.ats == args.only]
-    if not targets:
+    if not refresh.scrape_jobs(conn, only=args.only, workers=args.workers):
         sys.exit("nothing to scrape, add companies with: magstrel company add ...")
-    targets.sort(key=lambda t: t.ats == "yc")
-
-    sources = SOURCES | {
-        "yc": partial(yc_jobs.fetch, known_ids=db.known_external_ids(conn, "yc"))
-    }
-
-    with ThreadPoolExecutor(max_workers=args.workers) as pool:
-        futures = {pool.submit(_fetch, target, sources): target for target in targets}
-        for future in as_completed(futures):
-            target = futures[future]
-            try:
-                jobs = future.result()
-            except Exception as err:  # noqa: BLE001
-                print(f"{target.name}: FAILED ({err})")
-                continue
-            new, closed = db.save_jobs(conn, target.company_id, jobs)
-            print(f"{target.name}: {len(jobs)} fetched, {new} new, {closed} closed")
-    open_jobs, closed_jobs = db.count_jobs(conn)
-    print(f"database: {open_jobs} open jobs, {closed_jobs} closed")
 
 
-def _fetch(
-    target: ScrapeTarget, sources: dict[str, Callable[[str, str], list[Job]]]
-) -> list[Job]:
-    fetch = sources.get(target.ats)
-    if fetch is None:
-        raise ValueError(f"unknown ats {target.ats!r}")
-    return fetch(target.board, target.name)
+def cmd_enrich(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
+    refresh.enrich_jobs(conn, force=args.all)
+
+
+def cmd_company_import_yc(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
+    refresh.import_yc(conn, include_all=args.all)
+
+
+def cmd_company_discover(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
+    refresh.discover_boards(
+        conn, limit=args.limit, workers=args.workers, recheck_all=args.all
+    )
 
 
 def cmd_company_add(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
@@ -228,64 +360,6 @@ def cmd_company_list(conn: sqlite3.Connection, args: argparse.Namespace) -> None
         board = f"{c.ats}/{c.board}" if c.ats else "-"
         tags = ",".join(c.tags) or "-"
         print(f"{c.id:>4}  {c.name:<20} {board:<24} {tags}")
-
-
-def cmd_company_import_yc(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
-    print("downloading YC company list...")
-    existing = {c.name.lower(): c for c in db.list_companies(conn)}
-    added = updated = 0
-    for company in yc_companies.fetch_companies(include_all=args.all):
-        current = existing.get(company.name.lower())
-        if current is None:
-            company.id = db.add_company(conn, company)
-            existing[company.name.lower()] = company
-            added += 1
-        else:
-            _fill_missing(current, company)
-            db.update_company(conn, current)
-            updated += 1
-    print(f"added {added} companies, updated {updated} existing ones")
-
-
-def _fill_missing(current: Company, new: Company) -> None:
-    current.website = current.website or new.website
-    current.description = current.description or new.description
-    current.employees_min = current.employees_min or new.employees_min
-    current.employees_max = current.employees_max or new.employees_max
-    current.company_type = current.company_type or new.company_type
-    current.yc_slug = current.yc_slug or new.yc_slug
-    current.tags += [t for t in new.tags if t not in current.tags]
-
-
-def cmd_company_discover(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
-    todo = [c for c in db.list_companies(conn) if c.ats is None]
-    if args.limit:
-        todo = todo[: args.limit]
-    print(f"looking up {len(todo)} companies...")
-
-    found = 0
-    with ThreadPoolExecutor(max_workers=args.workers) as pool:
-        futures = {pool.submit(discover.find_board, c.name, c.website): c for c in todo}
-        for future in as_completed(futures):
-            company = futures[future]
-            try:
-                result = future.result()
-            except Exception as err:  # noqa: BLE001
-                print(f"{company.name}: ERROR ({err})")
-                continue
-            if result is None:
-                continue
-            company.ats, company.board = result
-            try:
-                db.update_company(conn, company)
-            except sqlite3.IntegrityError:
-                print(
-                    f"{company.name}: {company.ats}/{company.board} already belongs to another company"
-                )
-                continue
-            found += 1
-            print(f"{company.name}: {company.ats}/{company.board}")
-    print(f"found {found} of {len(todo)}")
 
 
 def cmd_search(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
@@ -378,36 +452,9 @@ def cmd_mcp(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
     mcp_server.server.run("stdio")
 
 
-def cmd_serve(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
-    uvicorn.run("magstrel.web.app:app", host=args.host, port=args.port)
-
-
 def cmd_open(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
     job = db.get_job(conn, args.id)
     if job is None:
         sys.exit(f"no job with id {args.id}")
     webbrowser.open(job["official_posting_url"])
     print(f"opened {job['official_posting_url']}")
-
-
-def cmd_enrich(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
-    todo = []
-    for row in db.enrichment_state(conn, rules.METHOD):
-        input_hash = rules.input_hash(row["role"], row["location"], row["description"])
-        outdated = row["version"] is None or row["version"] < rules.VERSION
-        if args.all or outdated or row["input_hash"] != input_hash:
-            todo.append((row, input_hash))
-    if not todo:
-        print("everything is already enriched")
-        return
-
-    print(f"enriching {len(todo)} jobs with rules v{rules.VERSION}...")
-    results = [
-        (row["id"], input_hash, rules.enrich(row["role"], row["location"], row["description"]))
-        for row, input_hash in todo
-    ]
-    db.save_enrichments(conn, rules.METHOD, rules.VERSION, results)
-
-    for field_name in ("work_type", "seniority", "category", "min_loe", "salary", "visa", "skills"):
-        filled = sum(1 for _, _, e in results if getattr(e, field_name))
-        print(f"  {field_name:<10} found for {filled:>6} of {len(results)}")

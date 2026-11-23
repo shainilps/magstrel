@@ -1,5 +1,5 @@
 import re
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from html.parser import HTMLParser
 
 
@@ -80,3 +80,20 @@ class _TextParser(HTMLParser):
 
     def handle_data(self, data: str) -> None:
         self.parts.append(data)
+
+
+def parse_duration(text: str) -> timedelta:
+    match = re.fullmatch(r"(\d+)\s*([mhd])", text.strip().lower())
+    if not match:
+        raise ValueError(f"can't read duration {text!r}, use e.g. 30m, 6h or 1d")
+    amount, unit = int(match[1]), match[2]
+    return {"m": timedelta(minutes=amount), "h": timedelta(hours=amount), "d": timedelta(days=amount)}[unit]
+
+
+def until(iso: str | None) -> str:
+    if not iso:
+        return "?"
+    remaining = datetime.fromisoformat(iso) - datetime.now(UTC)
+    if remaining.total_seconds() <= 0:
+        return "a moment"
+    return age((datetime.now(UTC) - remaining).isoformat())

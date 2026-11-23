@@ -10,6 +10,20 @@
 {% endmacro %}
 
 {% block content %}
+<div class="muted" style="display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin-bottom: 12px; font-size: 14px;">
+  {% if state.refresh_status == "running" %}
+    <span><strong>refreshing:</strong> {{ state.current_step }}</span>
+  {% elif state.last_run_finished_at %}
+    <span>last refresh {{ state.last_run_finished_at | age }} ago ({{ state.last_run_result }})</span>
+    {% if refresher_on and state.next_run_at %}<span>next in {{ state.next_run_at | until }}</span>{% endif %}
+  {% else %}
+    <span>never refreshed yet</span>
+  {% endif %}
+  {% if refresher_on and state.refresh_status != "running" %}
+    <form method="post" action="/refresh" style="margin: 0;"><button type="submit">Refresh now</button></form>
+  {% endif %}
+</div>
+
 <form method="get" class="card" style="display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 20px;">
   <input name="q" value="{{ form.q }}" placeholder="search: rust backend, c++ ..." style="flex: 1 1 260px;" autofocus>
   {{ select("seniority", "level", options.seniority) }}

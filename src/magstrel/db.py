@@ -44,10 +44,17 @@ RETURNING first_seen = last_seen AS is_new
 """
 
 
-def connect(path: str | None = None) -> sqlite3.Connection:
-    conn = sqlite3.connect(path or os.environ.get("MAGSTREL_DB", "jobs.db"))
+def path() -> Path:
+    return Path(os.environ.get("MAGSTREL_DB", "jobs.db")).resolve()
+
+
+def connect(db_path: str | Path | None = None) -> sqlite3.Connection:
+    # timeout: wait up to 30s for another writer (the background refresher) instead of failing
+    conn = sqlite3.connect(db_path or path(), timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    # WAL: readers (web page, mcp) never block on the refresher's writes, and vice versa
+    conn.execute("PRAGMA journal_mode = WAL")
     return conn
 
 
@@ -356,3 +363,45 @@ def _to_row(job: Job, company_id: int, now: str) -> dict:
         "raw": json.dumps(job.raw),
         "now": now,
     }
+
+
+def get_state(conn: sqlite3.Connection) -> dict[str, str]:
+    try:
+        rows = conn.execute("SELECT key, value FROM app_state").fetchall()
+    except sqlite3.OperationalError:  # before migration 0007
+        return {}
+    return {row["key"]: row["value"] for row in rows}
+
+
+def set_state(conn: sqlite3.Connection, **values: str | None) -> None:
+    with conn:
+        for key, value in values.items():
+            if value is None:
+                conn.execute("DELETE FROM app_state WHERE key = ?", (key,))
+            else:
+                conn.execute(
+                    "INSERT INTO app_state (key, value) VALUES (?, ?)"
+                    " ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                    (key, value),
+                )
+
+
+def companies_to_discover(conn: sqlite3.Connection, checked_before: str) -> list[Company]:
+    rows = conn.execute(
+        "SELECT * FROM companies WHERE ats IS NULL"
+        " AND (ats_checked_at IS NULL OR ats_checked_at < ?) ORDER BY name",
+        (checked_before,),
+    )
+    return [_to_company(row) for row in rows]
+
+
+def mark_ats_checked(conn: sqlite3.Connection, company_ids: list[int], when: str) -> None:
+    with conn:
+        conn.executemany(
+            "UPDATE companies SET ats_checked_at = ? WHERE id = ?",
+            [(when, company_id) for company_id in company_ids],
+        )
+
+
+def count_companies(conn: sqlite3.Connection) -> int:
+    return conn.execute("SELECT COUNT(*) AS n FROM companies").fetchone()["n"]

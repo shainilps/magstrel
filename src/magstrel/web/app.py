@@ -1,20 +1,37 @@
 import json
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Any, get_args
 
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
-from magstrel import db
+from magstrel import db, mcp_server
 from magstrel.models import Category, CompanyType, SearchQuery, Seniority
-from magstrel.utils import age, format_employees
+from magstrel.scheduler import Refresher
+from magstrel.utils import age, format_employees, until
 
-app = FastAPI(title="magstrel")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    # app.state.refresh_every is set by `magstrel server` before uvicorn starts the app
+    every = getattr(app.state, "refresh_every", None)
+    app.state.refresher = Refresher(every) if every else None
+    if app.state.refresher:
+        app.state.refresher.start()
+    async with mcp_server.server.session_manager.run():
+        yield
+    if app.state.refresher:
+        app.state.refresher.stop()
+
+
+app = FastAPI(title="magstrel", lifespan=lifespan)
 templates = Jinja2Templates(directory=Path(__file__).parent / "templates")
 templates.env.filters["age"] = age
+templates.env.filters["until"] = until
 
 
 def _safe_url(url: str | None) -> str:
@@ -89,11 +106,22 @@ def search_page(
         "category": get_args(Category),
         "company_type": get_args(CompanyType),
     }
-    return templates.TemplateResponse(
-        request,
-        "search.html",
-        {"jobs": jobs, "form": form, "options": options, "error": error},
-    )
+    context = {
+        "jobs": jobs,
+        "form": form,
+        "options": options,
+        "error": error,
+        "state": db.get_state(conn),
+        "refresher_on": request.app.state.refresher is not None,
+    }
+    return templates.TemplateResponse(request, "search.html", context)
+
+
+@app.post("/refresh")
+def refresh_now(request: Request) -> RedirectResponse:
+    if request.app.state.refresher:
+        request.app.state.refresher.trigger()
+    return RedirectResponse("/", status_code=303)
 
 
 @app.get("/jobs/{job_id}", response_class=HTMLResponse)
@@ -117,3 +145,6 @@ def _choice(value: str, allowed: Any) -> Any:
 
 def _number(text: str) -> int | None:
     return int(text) if text.strip().isdigit() else None
+
+
+app.router.routes.extend(mcp_server.server.streamable_http_app().routes)
