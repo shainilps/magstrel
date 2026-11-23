@@ -4,6 +4,9 @@ from typing import Any, Literal
 
 WorkType = Literal["remote", "hybrid", "in-office"]
 CompanyType = Literal["startup", "midsize", "bigtech"]
+ApplicationStatus = Literal[
+    "saved", "applied", "interviewing", "offer", "rejected", "withdrawn", "not_interested"
+]
 Seniority = Literal[
     "intern", "junior", "mid", "senior", "staff", "principal", "lead", "manager", "director"
 ]
@@ -57,6 +60,7 @@ class SearchQuery:
     skill: str | None = None
     years: int | None = None
     include_closed: bool = False
+    hide_tracked_for: int | None = None
     limit: int = 30
 
 

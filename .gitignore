@@ -5,3 +5,5 @@ __pycache__/
 jobs.db
 magstrel.pid
 magstrel.log
+jobs.db-wal
+jobs.db-shm

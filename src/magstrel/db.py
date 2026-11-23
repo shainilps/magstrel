@@ -299,6 +299,11 @@ def search_jobs(conn: sqlite3.Connection, query: SearchQuery) -> list[sqlite3.Ro
         params.append(query.years)
     if not query.include_closed:
         where.append("j.closed_at IS NULL")
+    if query.hide_tracked_for is not None:
+        where.append(
+            "NOT EXISTS (SELECT 1 FROM applications a WHERE a.job_id = j.id AND a.profile_id = ?)"
+        )
+        params.append(query.hide_tracked_for)
     if query.days is not None:
         since = datetime.now(UTC) - timedelta(days=query.days)
         where.append("COALESCE(j.published, j.first_seen) >= ?")
@@ -405,3 +410,132 @@ def mark_ats_checked(conn: sqlite3.Connection, company_ids: list[int], when: str
 
 def count_companies(conn: sqlite3.Connection) -> int:
     return conn.execute("SELECT COUNT(*) AS n FROM companies").fetchone()["n"]
+
+
+def create_profile(conn: sqlite3.Connection, name: str, about: str = "") -> int:
+    with conn:
+        cur = conn.execute(
+            "INSERT INTO profiles (name, about, created_at) VALUES (?, ?, ?)",
+            (name, about, datetime.now(UTC).isoformat()),
+        )
+    profile_id = cur.lastrowid
+    assert profile_id is not None
+    return profile_id
+
+
+def list_profiles(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    return conn.execute(
+        """
+        SELECT p.id, p.name, p.about, p.created_at, COUNT(a.id) AS tracked
+        FROM profiles p LEFT JOIN applications a ON a.profile_id = p.id
+        GROUP BY p.id ORDER BY p.name
+        """
+    ).fetchall()
+
+
+def get_profile(conn: sqlite3.Connection, name: str) -> sqlite3.Row | None:
+    return conn.execute("SELECT * FROM profiles WHERE name = ?", (name,)).fetchone()
+
+
+def delete_profile(conn: sqlite3.Connection, profile_id: int) -> None:
+    with conn:
+        conn.execute("DELETE FROM profiles WHERE id = ?", (profile_id,))
+
+
+def track_application(
+    conn: sqlite3.Connection, profile_id: int, job_id: int, status: str, note: str, at: str
+) -> None:
+    now = datetime.now(UTC).isoformat()
+    with conn:
+        existing = conn.execute(
+            "SELECT id, applied_at FROM applications WHERE profile_id = ? AND job_id = ?",
+            (profile_id, job_id),
+        ).fetchone()
+        # applied_at is set the first time the status becomes "applied", then kept
+        applied_at = existing["applied_at"] if existing else None
+        if applied_at is None and status == "applied":
+            applied_at = at
+        if existing is None:
+            application_id = conn.execute(
+                "INSERT INTO applications"
+                " (profile_id, job_id, status, applied_at, created_at, updated_at)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (profile_id, job_id, status, applied_at, now, now),
+            ).lastrowid
+        else:
+            application_id = existing["id"]
+            conn.execute(
+                "UPDATE applications SET status = ?, applied_at = ?, updated_at = ? WHERE id = ?",
+                (status, applied_at, now, application_id),
+            )
+        conn.execute(
+            "INSERT INTO application_events (application_id, status, note, at) VALUES (?, ?, ?, ?)",
+            (application_id, status, note, at),
+        )
+
+
+def list_applications(
+    conn: sqlite3.Connection, profile_id: int, status: str | None = None
+) -> list[sqlite3.Row]:
+    sql = """
+        SELECT a.job_id, a.status, a.applied_at, a.updated_at, j.role, c.name AS company,
+               j.location, j.closed_at, j.official_posting_url
+        FROM applications a
+        JOIN jobs j ON j.id = a.job_id
+        JOIN companies c ON c.id = j.company_id
+        WHERE a.profile_id = ?
+    """
+    params: list[object] = [profile_id]
+    if status:
+        sql += " AND a.status = ?"
+        params.append(status)
+    sql += " ORDER BY a.updated_at DESC"
+    return conn.execute(sql, params).fetchall()
+
+
+def get_application(
+    conn: sqlite3.Connection, profile_id: int, job_id: int
+) -> tuple[sqlite3.Row, list[sqlite3.Row]] | None:
+    application = conn.execute(
+        """
+        SELECT a.id, a.job_id, a.status, a.applied_at, a.created_at, a.updated_at,
+               j.role, c.name AS company, j.location, j.closed_at, j.official_posting_url
+        FROM applications a
+        JOIN jobs j ON j.id = a.job_id
+        JOIN companies c ON c.id = j.company_id
+        WHERE a.profile_id = ? AND a.job_id = ?
+        """,
+        (profile_id, job_id),
+    ).fetchone()
+    if application is None:
+        return None
+    events = conn.execute(
+        "SELECT status, note, at FROM application_events WHERE application_id = ? ORDER BY at, id",
+        (application["id"],),
+    ).fetchall()
+    return application, events
+
+
+def delete_application(conn: sqlite3.Connection, profile_id: int, job_id: int) -> bool:
+    with conn:
+        cur = conn.execute(
+            "DELETE FROM applications WHERE profile_id = ? AND job_id = ?", (profile_id, job_id)
+        )
+    return cur.rowcount > 0
+
+
+def profile_activity(conn: sqlite3.Connection, profile_id: int) -> list[dict]:
+    rows = conn.execute(
+        """
+        SELECT a.id AS application_id, a.job_id, a.status AS current_status, a.applied_at,
+               e.status AS event_status, e.at, j.role, c.name AS company, j.category, j.seniority
+        FROM application_events e
+        JOIN applications a ON a.id = e.application_id
+        JOIN job_view j ON j.id = a.job_id
+        JOIN companies c ON c.id = j.company_id
+        WHERE a.profile_id = ?
+        ORDER BY e.at, e.id
+        """,
+        (profile_id,),
+    )
+    return [dict(row) for row in rows]

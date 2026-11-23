@@ -162,8 +162,11 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     conn = db.connect()
     try:
-        if args.command not in ("migrate", "down") and db.pending_migrations(conn):
-            sys.exit("database is out of date, run: magstrel migrate")
+        if db.pending_migrations(conn):
+            if args.command not in ("migrate", "down", "status"):
+                sys.exit("database is out of date, run: magstrel migrate")
+            if args.command == "status":
+                print("(database has pending migrations: run `magstrel migrate`)")
         args.run(conn, args)
     finally:
         conn.close()
