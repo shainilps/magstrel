@@ -10,7 +10,7 @@ from magstrel.enrich import rules
 from magstrel.models import Company, Job, ScrapeTarget
 from magstrel.sources.company import discover
 from magstrel.sources.company import yc as yc_companies
-from magstrel.sources.job import ashby, greenhouse, lever
+from magstrel.sources.job import SOURCES, hn, smartrecruiters
 from magstrel.sources.job import yc as yc_jobs
 
 log = logging.getLogger("magstrel")
@@ -19,11 +19,6 @@ Fetch = Callable[[str, str], list[Job]]
 # called as progress(done, total) while a step works through its list
 Progress = Callable[[int, int], None]
 
-SOURCES: dict[str, Fetch] = {
-    "greenhouse": greenhouse.fetch,
-    "lever": lever.fetch,
-    "ashby": ashby.fetch,
-}
 
 COMPANIES_EVERY = timedelta(days=1)
 RECHECK_BOARDS_AFTER = timedelta(days=30)
@@ -40,6 +35,8 @@ def refresh_all(conn: sqlite3.Connection, step: Callable[[str], None]) -> None:
         import_yc(conn)
         discover_boards(conn, progress=lambda done, total: step(f"finding job boards {done}/{total} companies"))
     scrape_jobs(conn, progress=lambda done, total: step(f"scraping jobs {done}/{total} companies"))
+    step("reading HN 'Who is hiring?'")
+    scrape_hn(conn)
     step("enriching new jobs")
     enrich_jobs(conn)
 
@@ -50,12 +47,20 @@ def scrape_jobs(
     workers: int = 8,
     progress: Progress | None = None,
 ) -> int:
+    if only == "hn":
+        return scrape_hn(conn)
     targets = db.list_scrape_targets(conn)
     if only:
         targets = [t for t in targets if t.ats == only]
     targets.sort(key=lambda t: t.ats == "yc")  # yc is throttled to 1 request/s: fast sources first
 
-    sources = SOURCES | {"yc": partial(yc_jobs.fetch, known_ids=db.known_external_ids(conn, "yc"))}
+    # these two fetch a description per job, so they skip the ones we already have
+    sources = SOURCES | {
+        "yc": partial(yc_jobs.fetch, known_ids=db.known_external_ids(conn, "yc")),
+        "smartrecruiters": partial(
+            smartrecruiters.fetch, known_ids=db.known_external_ids(conn, "smartrecruiters")
+        ),
+    }
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {pool.submit(_fetch, target, sources): target for target in targets}
         for done, future in enumerate(as_completed(futures), start=1):
@@ -125,6 +130,80 @@ def import_yc(conn: sqlite3.Connection, include_all: bool = False) -> tuple[int,
     log.info("added %d companies, updated %d existing ones", added, updated)
     db.set_state(conn, companies_imported_at=now_iso())
     return added, updated
+
+
+
+def scrape_hn(conn: sqlite3.Connection) -> int:
+    started = now_iso()
+    by_company: dict[str, list[Job]] = {}
+    for company, job in hn.fetch_latest():
+        by_company.setdefault(company, []).append(job)
+
+    new = 0
+    for name, jobs in by_company.items():
+        company_id = db.company_id_by_name(conn, name) or db.add_company(
+            conn, Company(name=name, tags=["hn-hiring"])
+        )
+        new += db.save_jobs(conn, company_id, jobs, close_missing=False)[0]
+    # posts not in the current thread (last month's, or deleted) are closed
+    closed = db.close_unseen(conn, "hn", started)
+    posts = sum(len(jobs) for jobs in by_company.values())
+    log.info("HN who is hiring: %d posts from %d companies, %d new, %d closed", posts, len(by_company), new, closed)
+    db.set_state(conn, hn_scraped_at=now_iso())
+    return posts
+
+
+def verify_boards(
+    conn: sqlite3.Connection, workers: int = 8, company: str | None = None
+) -> list[dict]:
+    targets = [t for t in db.list_scrape_targets(conn) if t.ats in SOURCES]
+    if company:
+        targets = [t for t in targets if t.name.lower() == company.lower()]
+    companies = {c.id: c for c in db.linked_companies(conn)}
+    websites = {company_id: c.website for company_id, c in companies.items()}
+    log.info("checking the job boards of %d companies...", len(targets))
+    suspects: list[dict] = []
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {
+            pool.submit(discover.verify_board, t.ats, t.board, t.name, websites.get(t.company_id)): t
+            for t in targets
+        }
+        for future in as_completed(futures):
+            target = futures[future]
+            try:
+                verdict = future.result()
+            except Exception as err:  # noqa: BLE001
+                log.warning("%s: couldn't check (%s)", target.name, err)
+                continue
+            # report only: genuine companies sometimes never write their own name in a posting,
+            # so a human decides (magstrel company unlink NAME). None = no jobs, nothing to judge
+            if verdict is False:
+                samples = db.sample_jobs(conn, target.company_id, target.ats)
+                details = companies[target.company_id]
+                suspects.append(
+                    {
+                        "company": target.name,
+                        "board": f"{target.ats}/{target.board}",
+                        "company_website": details.website,
+                        "company_description": details.description,
+                        "sample_jobs_on_board": [dict(row) for row in samples],
+                    }
+                )
+                example = samples[0]["role"] if samples else ""
+                log.info("suspect: %s -> %s/%s  (e.g. %r)", target.name, target.ats, target.board, example)
+    log.info("%d suspects out of %d", len(suspects), len(targets))
+    return suspects
+
+
+
+def unlink_company(conn: sqlite3.Connection, name: str) -> int | None:
+    # returns how many jobs were closed, or None when there's no such company
+    company_id = db.company_id_by_name(conn, name)
+    if company_id is None:
+        return None
+    closed = db.unlink_board(conn, company_id)
+    log.info("unlinked %s's job board, closed %d jobs", name, closed)
+    return closed
 
 
 def _fill_missing(current: Company, new: Company) -> None:

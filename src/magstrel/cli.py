@@ -65,7 +65,7 @@ def main() -> None:
     scrape.add_argument("--workers", type=int, default=8, help="parallel downloads")
     scrape.add_argument(
         "--only",
-        choices=[*refresh.SOURCES, "yc"],
+        choices=[*refresh.SOURCES, "yc", "hn"],
         help="scrape just one source, e.g. --only yc",
     )
     scrape.set_defaults(run=cmd_scrape)
@@ -108,6 +108,17 @@ def main() -> None:
         help="also recheck companies looked up in the last 30 days",
     )
     find.set_defaults(run=cmd_company_discover)
+
+    verify = company_commands.add_parser(
+        "verify", help="list companies whose linked job board may belong to someone else"
+    )
+    verify.add_argument("name", nargs="?", help="check just this company")
+    verify.set_defaults(run=cmd_company_verify)
+    unlink = company_commands.add_parser(
+        "unlink", help="forget a company's job board (a wrong match) and close its jobs"
+    )
+    unlink.add_argument("name")
+    unlink.set_defaults(run=cmd_company_unlink)
 
     enrich = commands.add_parser(
         "enrich", help="work out seniority, category, skills, ... from each job's text"
@@ -329,6 +340,16 @@ def cmd_company_discover(conn: sqlite3.Connection, args: argparse.Namespace) -> 
     refresh.discover_boards(
         conn, limit=args.limit, workers=args.workers, recheck_all=args.all
     )
+
+
+def cmd_company_verify(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
+    if refresh.verify_boards(conn, company=args.name):
+        print('check those boards, then unlink wrong ones with: magstrel company unlink "NAME"')
+
+
+def cmd_company_unlink(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
+    if refresh.unlink_company(conn, args.name) is None:
+        sys.exit(f"no company named {args.name!r}")
 
 
 def cmd_company_add(conn: sqlite3.Connection, args: argparse.Namespace) -> None:

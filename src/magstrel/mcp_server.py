@@ -10,7 +10,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
-from magstrel import db, stats
+from magstrel import db, refresh, stats
 from magstrel.models import ApplicationStatus, Category, CompanyType, SearchQuery, Seniority
 
 server = MCPServer(
@@ -304,6 +304,42 @@ def profile_stats(
         found = _profile(conn, profile)
         activity = db.profile_activity(conn, found["id"])
     return {"profile": found["name"]} | stats.profile_stats(activity, datetime.now(UTC), days)
+
+
+@server.tool(
+    description=(
+        "Re-check that each company's linked job board really is that company's (a same-named "
+        "company's board, or a junk one, sometimes gets matched). Returns only the suspects, "
+        "each with the company's own description and website and sample jobs from the board, "
+        "so you can judge; then call unlink_company_board for the wrong ones. Many suspects are "
+        "genuine companies that just never write their own name in a posting. Checking every "
+        "company takes about a minute; pass a company to check just one. Changes nothing."
+    ),
+    annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True),
+)
+def verify_company_boards(
+    company: Annotated[str | None, Field(description="check just this company")] = None,
+) -> list[dict[str, Any]]:
+    with _connection() as conn:
+        return refresh.verify_boards(conn, company=company)
+
+
+@server.tool(
+    description=(
+        "Unlink a company's job board because it belongs to someone else. Closes the jobs that "
+        "came from that board; a YC company falls back to its YC page on the next refresh."
+    ),
+    annotations=DELETES,
+)
+def unlink_company_board(
+    company: Annotated[str, Field(description="exact company name, as verify_company_boards shows it")],
+) -> str:
+    with _connection() as conn:
+        closed = refresh.unlink_company(conn, company)
+    if closed is None:
+        raise ToolError(f"no company named {company!r}")
+    return f"unlinked {company}'s job board and closed {closed} of its jobs"
+
 
 def _profile(conn: sqlite3.Connection, name: str) -> sqlite3.Row:
     profile = db.get_profile(conn, name)

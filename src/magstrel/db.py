@@ -185,22 +185,58 @@ def _to_company(row: sqlite3.Row) -> Company:
 
 
 def save_jobs(
-    conn: sqlite3.Connection, company_id: int, jobs: list[Job]
+    conn: sqlite3.Connection, company_id: int, jobs: list[Job], close_missing: bool = True
 ) -> tuple[int, int]:
     # returns (new jobs, jobs closed because this scrape no longer lists them)
     now = datetime.now(UTC).isoformat()
-    new = 0
+    new = closed = 0
     with conn:
         for job in jobs:
             row = conn.execute(UPSERT, _to_row(job, company_id, now)).fetchone()
             new += row["is_new"]
-        # every job this scrape returned now has last_seen = now; anything older is gone
-        closed = conn.execute(
-            "UPDATE jobs SET closed_at = ?"
-            " WHERE company_id = ? AND last_seen < ? AND closed_at IS NULL",
-            (now, company_id, now),
-        ).rowcount
+        if close_missing:
+            # every job this scrape returned now has last_seen = now; anything older is gone.
+            # hn posts are left alone: they come and go with the monthly thread (close_unseen)
+            closed = conn.execute(
+                "UPDATE jobs SET closed_at = ?"
+                " WHERE company_id = ? AND last_seen < ? AND closed_at IS NULL AND source <> 'hn'",
+                (now, company_id, now),
+            ).rowcount
     return new, closed
+
+
+def close_unseen(conn: sqlite3.Connection, source: str, seen_since: str) -> int:
+    with conn:
+        return conn.execute(
+            "UPDATE jobs SET closed_at = ?"
+            " WHERE source = ? AND last_seen < ? AND closed_at IS NULL",
+            (datetime.now(UTC).isoformat(), source, seen_since),
+        ).rowcount
+
+
+def company_id_by_name(conn: sqlite3.Connection, name: str) -> int | None:
+    row = conn.execute("SELECT id FROM companies WHERE name = ? COLLATE NOCASE", (name,)).fetchone()
+    return row["id"] if row else None
+
+
+def linked_companies(conn: sqlite3.Connection) -> list[Company]:
+    rows = conn.execute("SELECT * FROM companies WHERE ats IS NOT NULL AND board IS NOT NULL")
+    return [_to_company(row) for row in rows]
+
+
+def unlink_board(conn: sqlite3.Connection, company_id: int) -> int:
+    # forget a wrongly matched board and close the jobs that came from it
+    now = datetime.now(UTC).isoformat()
+    with conn:
+        conn.execute(
+            "UPDATE companies SET ats = NULL, board = NULL, ats_checked_at = ? WHERE id = ?",
+            (now, company_id),
+        )
+        return conn.execute(
+            "UPDATE jobs SET closed_at = ? WHERE company_id = ? AND closed_at IS NULL"
+            " AND source NOT IN ('yc', 'hn')",
+            (now, company_id),
+        ).rowcount
 
 
 def known_external_ids(conn: sqlite3.Connection, source: str) -> frozenset[str]:
@@ -539,3 +575,13 @@ def profile_activity(conn: sqlite3.Connection, profile_id: int) -> list[dict]:
         (profile_id,),
     )
     return [dict(row) for row in rows]
+
+
+def sample_jobs(
+    conn: sqlite3.Connection, company_id: int, source: str, limit: int = 3
+) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT role, location, substr(description, 1, 300) AS snippet FROM jobs"
+        " WHERE company_id = ? AND source = ? AND closed_at IS NULL LIMIT ?",
+        (company_id, source, limit),
+    ).fetchall()
