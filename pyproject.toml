@@ -7,7 +7,12 @@ authors = [
     { name = "shainilps", email = "shainilps.work@gmail.com" }
 ]
 requires-python = ">=3.14"
-dependencies = []
+dependencies = [
+    "fastapi>=0.165.0",
+    "jinja2>=3.1.6",
+    "mcp>=2.3.0",
+    "uvicorn>=0.54.0",
+]
 
 [project.scripts]
 magstrel = "magstrel.cli:main"
@@ -18,5 +23,6 @@ build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
+    "httpx2>=2.16.2",
     "pytest>=9.2.0",
 ]

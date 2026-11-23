@@ -1,4 +1,5 @@
 import json
+import os
 import re
 import sqlite3
 from datetime import UTC, datetime, timedelta
@@ -43,8 +44,8 @@ RETURNING first_seen = last_seen AS is_new
 """
 
 
-def connect(path: str = "jobs.db") -> sqlite3.Connection:
-    conn = sqlite3.connect(path)
+def connect(path: str | None = None) -> sqlite3.Connection:
+    conn = sqlite3.connect(path or os.environ.get("MAGSTREL_DB", "jobs.db"))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
@@ -298,7 +299,7 @@ def search_jobs(conn: sqlite3.Connection, query: SearchQuery) -> list[sqlite3.Ro
 
     sql = """
         SELECT j.id, j.role, j.location, j.work_type, j.published, j.first_seen,
-               c.name AS company
+               j.salary, j.seniority, j.category, c.name AS company
         FROM job_view j
         JOIN companies c ON c.id = j.company_id
     """

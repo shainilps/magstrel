@@ -9,7 +9,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import partial
 from typing import get_args
 
-from magstrel import db
+import uvicorn
+
+from magstrel import db, mcp_server
 from magstrel.enrich import rules
 from magstrel.models import (
     Category,
@@ -122,6 +124,15 @@ def main() -> None:
     )
     search.add_argument("--limit", type=int, default=30)
     search.set_defaults(run=cmd_search)
+
+    commands.add_parser(
+        "mcp", help="run the MCP server on stdio (started by Claude Code, not by hand)"
+    ).set_defaults(run=cmd_mcp)
+
+    serve = commands.add_parser("serve", help="run the web page (default http://127.0.0.1:8000)")
+    serve.add_argument("--host", default="127.0.0.1", help="127.0.0.1 = only this computer")
+    serve.add_argument("--port", type=int, default=8000)
+    serve.set_defaults(run=cmd_serve)
 
     show = commands.add_parser("show", help="show one job in full")
     show.add_argument("id", type=int)
@@ -360,6 +371,15 @@ def cmd_show(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
             print(f"  {who}: {link or '-'}")
     print()
     print(job["description"] or "(no description)")
+
+
+def cmd_mcp(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
+    conn.close()
+    mcp_server.server.run("stdio")
+
+
+def cmd_serve(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
+    uvicorn.run("magstrel.web.app:app", host=args.host, port=args.port)
 
 
 def cmd_open(conn: sqlite3.Connection, args: argparse.Namespace) -> None:

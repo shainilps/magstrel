@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% block title %}{{ job.role }} at {{ job.company_name }}{% endblock %}
+
+{% block content %}
+<p><a href="javascript:history.back()">&larr; back</a></p>
+
+<div class="card" style="margin-bottom: 16px;">
+  <h2 style="margin: 0 0 4px;">{{ job.role }}</h2>
+  <div>{{ job.company_name }} &middot; {{ job.location }}{% if job.work_type %} &middot; {{ job.work_type }}{% endif %}</div>
+  <div class="muted">posted {{ (job.published or job.first_seen) | age }} ago</div>
+  {% if job.closed_at %}<p class="error">Closed: no longer posted since {{ job.closed_at | age }} ago</p>{% endif %}
+  <p>
+    {% for label, value in [("level", job.seniority), ("category", job.category), ("salary", job.salary),
+                            ("equity", job.equity), ("visa", job.visa)] if value %}
+      <span class="tag">{{ label }}: {{ value }}</span>
+    {% endfor %}
+    {% if job.min_loe is not none %}
+      <span class="tag">experience: {{ job.min_loe }}{% if job.max_loe %}-{{ job.max_loe }}{% else %}+{% endif %} years</span>
+    {% endif %}
+  </p>
+  {% if skills %}<p>{% for skill in skills %}<span class="tag">{{ skill }}</span>{% endfor %}</p>{% endif %}
+  <p><a href="{{ job.official_posting_url | safe_url }}" target="_blank" rel="noopener noreferrer">Open the posting &rarr;</a></p>
+</div>
+
+<div class="card" style="margin-bottom: 16px;">
+  <h3 style="margin: 0 0 4px;">About {{ job.company_name }}</h3>
+  <div>{{ job.company_description or "" }}</div>
+  <div class="muted">
+    {{ job.company_type or "" }} &middot; {{ employees }}
+    {% if job.website %} &middot; <a href="{{ job.website | safe_url }}" target="_blank" rel="noopener noreferrer">{{ job.website }}</a>{% endif %}
+  </div>
+  {% if tags %}<p>{% for tag in tags %}<a class="tag" href="/?tag={{ tag | urlencode }}">{{ tag }}</a>{% endfor %}</p>{% endif %}
+  {% if contacts %}
+    <h4 style="margin: 12px 0 4px;">Contacts</h4>
+    <ul style="margin: 0;">
+      {% for who, link in contacts.items() %}
+        <li>{% if link %}<a href="{{ link | safe_url }}" target="_blank" rel="noopener noreferrer">{{ who }}</a>{% else %}{{ who }}{% endif %}</li>
+      {% endfor %}
+    </ul>
+  {% endif %}
+</div>
+
+<div class="card">
+  <h3 style="margin: 0 0 8px;">Description</h3>
+  <div style="white-space: pre-wrap;">{{ job.description or "(no description)" }}</div>
+</div>
+{% endblock %}
