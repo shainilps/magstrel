@@ -1,11 +1,15 @@
+import html
 from datetime import datetime
 
 from magstrel import net
 from magstrel.models import Job
+from magstrel.utils import html_to_text
 
 
 def fetch(board: str, company: str) -> list[Job]:
-    data = net.get_json(f"https://boards-api.greenhouse.io/v1/boards/{board}/jobs")
+    data = net.get_json(
+        f"https://boards-api.greenhouse.io/v1/boards/{board}/jobs?content=true"
+    )
     return [_to_job(raw, company) for raw in data["jobs"]]
 
 
@@ -19,5 +23,6 @@ def _to_job(raw: dict, company: str) -> Job:
         role=raw["title"].strip(),
         location=(raw.get("location") or {}).get("name", ""),
         official_posting_url=raw["absolute_url"],
+        description=html_to_text(html.unescape(raw.get("content") or "")),
         published=datetime.fromisoformat(published) if published else None,
     )

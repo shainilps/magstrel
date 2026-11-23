@@ -1,4 +1,6 @@
+import re
 from datetime import UTC, datetime
+from html.parser import HTMLParser
 
 
 def parse_employees(text: str | None) -> tuple[int | None, int | None]:
@@ -48,3 +50,33 @@ def format_employees(low: int | None, high: int | None) -> str:
 
 def cut(text: str, width: int) -> str:
     return text if len(text) <= width else text[: width - 1] + "…"
+
+
+def html_to_text(html: str) -> str:
+    parser = _TextParser()
+    parser.feed(html)
+    parser.close()
+    text = "".join(parser.parts)
+    lines = [re.sub(r"[ \t\xa0]+", " ", line).strip() for line in text.splitlines()]
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+
+
+class _TextParser(HTMLParser):
+    _BLOCKS = {"p", "div", "br", "h1", "h2", "h3", "h4", "h5", "h6", "ul", "ol", "tr", "section"}
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.parts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag == "li":
+            self.parts.append("\n- ")
+        elif tag in self._BLOCKS:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in self._BLOCKS:
+            self.parts.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        self.parts.append(data)

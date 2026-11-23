@@ -10,12 +10,15 @@ from functools import partial
 from typing import get_args
 
 from magstrel import db
+from magstrel.enrich import rules
 from magstrel.models import (
+    Category,
     Company,
     CompanyType,
     Job,
     ScrapeTarget,
     SearchQuery,
+    Seniority,
     WorkType,
 )
 from magstrel.sources.company import discover
@@ -85,6 +88,12 @@ def main() -> None:
     find.add_argument("--workers", type=int, default=8, help="parallel lookups")
     find.set_defaults(run=cmd_company_discover)
 
+    enrich = commands.add_parser(
+        "enrich", help="work out seniority, category, skills, ... from each job's text"
+    )
+    enrich.add_argument("--all", action="store_true", help="redo every job, not just new ones")
+    enrich.set_defaults(run=cmd_enrich)
+
     search = commands.add_parser("search", help="search jobs")
     search.add_argument(
         "terms", nargs="*", help="words to search for, e.g. rust backend"
@@ -102,6 +111,12 @@ def main() -> None:
     search.add_argument("--location", help="location contains, e.g. london")
     search.add_argument("--max-employees", type=int)
     search.add_argument("--days", type=int, help="posted in the last N days")
+    search.add_argument("--seniority", choices=get_args(Seniority))
+    search.add_argument("--category", choices=get_args(Category))
+    search.add_argument("--skill", help="e.g. python, rust, kubernetes")
+    search.add_argument(
+        "--years", type=int, help="your years of experience: hide jobs asking for more"
+    )
     search.add_argument(
         "--closed", action="store_true", help="also show jobs that are no longer posted"
     )
@@ -272,6 +287,10 @@ def cmd_search(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
         company=args.company,
         location=args.location,
         max_employees=args.max_employees,
+        seniority=args.seniority,
+        category=args.category,
+        skill=args.skill,
+        years=args.years,
         days=args.days,
         include_closed=args.closed,
         limit=args.limit,
@@ -320,9 +339,20 @@ def cmd_show(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
         if job[key]
     ]
     if job["min_loe"] is not None:
-        extras.append(f"experience: {job['min_loe']}+ years")
+        upper = f"-{job['max_loe']}" if job["max_loe"] else "+"
+        extras.append(f"experience: {job['min_loe']}{upper} years")
     if extras:
         print("\n" + " | ".join(extras))
+    level = " | ".join(
+        f"{label}: {job[key]}"
+        for label, key in (("level", "seniority"), ("category", "category"))
+        if job[key]
+    )
+    if level:
+        print(level)
+    job_skills = json.loads(job["skills"])
+    if job_skills:
+        print(f"skills: {', '.join(job_skills)}")
     contacts = json.loads(job["recruiter_detail"])
     if contacts:
         print("\ncontacts:")
@@ -338,3 +368,26 @@ def cmd_open(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
         sys.exit(f"no job with id {args.id}")
     webbrowser.open(job["official_posting_url"])
     print(f"opened {job['official_posting_url']}")
+
+
+def cmd_enrich(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
+    todo = []
+    for row in db.enrichment_state(conn, rules.METHOD):
+        input_hash = rules.input_hash(row["role"], row["location"], row["description"])
+        outdated = row["version"] is None or row["version"] < rules.VERSION
+        if args.all or outdated or row["input_hash"] != input_hash:
+            todo.append((row, input_hash))
+    if not todo:
+        print("everything is already enriched")
+        return
+
+    print(f"enriching {len(todo)} jobs with rules v{rules.VERSION}...")
+    results = [
+        (row["id"], input_hash, rules.enrich(row["role"], row["location"], row["description"]))
+        for row, input_hash in todo
+    ]
+    db.save_enrichments(conn, rules.METHOD, rules.VERSION, results)
+
+    for field_name in ("work_type", "seniority", "category", "min_loe", "salary", "visa", "skills"):
+        filled = sum(1 for _, _, e in results if getattr(e, field_name))
+        print(f"  {field_name:<10} found for {filled:>6} of {len(results)}")

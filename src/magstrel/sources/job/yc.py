@@ -40,7 +40,6 @@ def fetch(
 
 
 def _founder_contacts(company: dict) -> dict[str, str]:
-    # {"Sean OBrien (CEO)": "https://linkedin.com/in/..."}; at YC startups founders usually hire
     contacts = {}
     for founder in company.get("founders") or []:
         if not founder.get("is_active", True) or not founder.get("full_name"):

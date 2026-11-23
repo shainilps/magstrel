@@ -4,7 +4,7 @@ import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from magstrel.models import Company, Job, ScrapeTarget, SearchQuery
+from magstrel.models import Company, Enrichment, Job, ScrapeTarget, SearchQuery
 from magstrel.utils import to_iso
 
 MIGRATIONS_DIR = Path(__file__).parent / "migrations"
@@ -80,9 +80,6 @@ def migrate(conn: sqlite3.Connection) -> list[str]:
             raise
         applied.append(path.name)
     return applied
-
-
-# ---- companies ----
 
 
 def add_company(conn: sqlite3.Connection, company: Company) -> int:
@@ -179,9 +176,6 @@ def _to_company(row: sqlite3.Row) -> Company:
     )
 
 
-# ---- jobs ----
-
-
 def save_jobs(
     conn: sqlite3.Connection, company_id: int, jobs: list[Job]
 ) -> tuple[int, int]:
@@ -215,7 +209,46 @@ def count_jobs(conn: sqlite3.Connection) -> tuple[int, int]:
     return row["open"], row["closed"]
 
 
-# ---- search ----
+def enrichment_state(conn: sqlite3.Connection, method: str) -> list[sqlite3.Row]:
+    return conn.execute(
+        """
+        SELECT j.id, j.role, j.location, j.description, e.version, e.input_hash
+        FROM jobs j
+        LEFT JOIN job_enrichment e ON e.job_id = j.id AND e.method = ?
+        """,
+        (method,),
+    ).fetchall()
+
+
+def save_enrichments(
+    conn: sqlite3.Connection,
+    method: str,
+    version: int,
+    results: list[tuple[int, str, Enrichment]],
+) -> None:
+    now = datetime.now(UTC).isoformat()
+    with conn:
+        conn.executemany(
+            """
+            INSERT INTO job_enrichment (
+                job_id, method, version, input_hash, enriched_at, work_type, min_loe,
+                max_loe, salary, visa, skills, seniority, category
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (job_id, method) DO UPDATE SET
+                version = excluded.version, input_hash = excluded.input_hash,
+                enriched_at = excluded.enriched_at, work_type = excluded.work_type,
+                min_loe = excluded.min_loe, max_loe = excluded.max_loe,
+                salary = excluded.salary, visa = excluded.visa, skills = excluded.skills,
+                seniority = excluded.seniority, category = excluded.category
+            """,
+            [
+                (
+                    job_id, method, version, input_hash, now, e.work_type, e.min_loe,
+                    e.max_loe, e.salary, e.visa, json.dumps(e.skills), e.seniority, e.category,
+                )
+                for job_id, input_hash, e in results
+            ],
+        )
 
 
 def search_jobs(conn: sqlite3.Connection, query: SearchQuery) -> list[sqlite3.Row]:
@@ -243,6 +276,19 @@ def search_jobs(conn: sqlite3.Connection, query: SearchQuery) -> list[sqlite3.Ro
     if query.max_employees is not None:
         where.append("c.employees_max <= ?")
         params.append(query.max_employees)
+    if query.seniority:
+        where.append("j.seniority = ?")
+        params.append(query.seniority)
+    if query.category:
+        where.append("j.category = ?")
+        params.append(query.category)
+    if query.skill:
+        where.append("EXISTS (SELECT 1 FROM json_each(j.skills) WHERE value = ?)")
+        params.append(query.skill.lower())
+    if query.years is not None:
+        # jobs you qualify for: no stated requirement, or one you meet
+        where.append("(j.min_loe IS NULL OR j.min_loe <= ?)")
+        params.append(query.years)
     if not query.include_closed:
         where.append("j.closed_at IS NULL")
     if query.days is not None:
@@ -253,7 +299,7 @@ def search_jobs(conn: sqlite3.Connection, query: SearchQuery) -> list[sqlite3.Ro
     sql = """
         SELECT j.id, j.role, j.location, j.work_type, j.published, j.first_seen,
                c.name AS company
-        FROM jobs j
+        FROM job_view j
         JOIN companies c ON c.id = j.company_id
     """
     if query.terms:
@@ -275,7 +321,7 @@ def get_job(conn: sqlite3.Connection, job_id: int) -> sqlite3.Row | None:
         """
         SELECT j.*, c.name AS company_name, c.website, c.description AS company_description,
                c.tags, c.employees_min, c.employees_max, c.company_type
-        FROM jobs j
+        FROM job_view j
         JOIN companies c ON c.id = j.company_id
         WHERE j.id = ?
         """,

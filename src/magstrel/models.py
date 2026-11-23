@@ -4,6 +4,14 @@ from typing import Any, Literal
 
 WorkType = Literal["remote", "hybrid", "in-office"]
 CompanyType = Literal["startup", "midsize", "bigtech"]
+Seniority = Literal[
+    "intern", "junior", "mid", "senior", "staff", "principal", "lead", "manager", "director"
+]
+Category = Literal[
+    "ml", "security", "mobile", "fullstack", "frontend", "backend", "data", "devops",
+    "embedded", "qa", "design", "product", "sales", "marketing", "support", "people",
+    "finance", "legal", "operations", "engineering",
+]
 
 
 @dataclass
@@ -44,6 +52,10 @@ class SearchQuery:
     location: str | None = None
     max_employees: int | None = None
     days: int | None = None
+    seniority: Seniority | None = None
+    category: Category | None = None
+    skill: str | None = None
+    years: int | None = None
     include_closed: bool = False
     limit: int = 30
 
@@ -71,3 +83,15 @@ class Job:
     salary: str | None = None
     equity: str | None = None
     visa: str | None = None
+
+
+@dataclass
+class Enrichment:
+    work_type: WorkType | None = None
+    min_loe: int | None = None
+    max_loe: int | None = None
+    salary: str | None = None
+    visa: str | None = None
+    skills: list[str] = field(default_factory=list)
+    seniority: Seniority | None = None
+    category: Category | None = None

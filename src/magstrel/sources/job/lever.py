@@ -31,4 +31,14 @@ def _to_job(raw: dict, company: str) -> Job:
         if created_ms
         else None,
         work_type=_WORK_TYPES.get(raw.get("workplaceType") or ""),
+        salary=_salary(raw.get("salaryRange")),
     )
+
+
+def _salary(salary_range: dict | None) -> str | None:
+    # {"min": 150000, "max": 200000, "currency": "USD", "interval": "per-year-salary"}
+    if not salary_range or not salary_range.get("min"):
+        return None
+    low, high = salary_range["min"], salary_range.get("max") or salary_range["min"]
+    currency = salary_range.get("currency") or ""
+    return f"{low:,} - {high:,} {currency}".strip()
