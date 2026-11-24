@@ -56,11 +56,23 @@ def search_jobs(
     ] = None,
     skill: Annotated[str | None, Field(description="e.g. python, go, kubernetes")] = None,
     company_tag: Annotated[str | None, Field(description="e.g. fintech, ai, yc-backed")] = None,
-    location: Annotated[str | None, Field(description="text the location contains")] = None,
+    location: Annotated[
+        str | None,
+        Field(description="text the location contains; a country name also matches its codes and cities"),
+    ] = None,
     years: Annotated[
         int | None, Field(description="candidate's years of experience: hides jobs asking for more")
     ] = None,
     days: Annotated[int | None, Field(description="only jobs posted in the last N days")] = None,
+    remote_from: Annotated[
+        str | None,
+        Field(
+            description=(
+                "country the candidate lives in, e.g. India or in: only remote jobs open to it "
+                "(by name, region like APAC, or worldwide) first, then remote jobs that name no place"
+            )
+        ),
+    ] = None,
     hide_tracked_for: Annotated[
         str | None,
         Field(description="profile name: hide jobs this profile already tracked (applied, saved, ...)"),
@@ -80,11 +92,15 @@ def search_jobs(
         location=location,
         years=years,
         days=days,
+        remote_from=remote_from,
         hide_tracked_for=profile_id,
         limit=limit,
     )
     with _connection() as conn:
-        rows = db.search_jobs(conn, query_obj)
+        try:
+            rows = db.search_jobs(conn, query_obj)
+        except ValueError as err:
+            raise ToolError(str(err)) from err
     return [
         {
             "id": row["id"],

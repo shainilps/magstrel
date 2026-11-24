@@ -59,6 +59,7 @@ class SearchQuery:
     category: Category | None = None
     skill: str | None = None
     years: int | None = None
+    remote_from: str | None = None
     include_closed: bool = False
     hide_tracked_for: int | None = None
     limit: int = 30
@@ -99,3 +100,5 @@ class Enrichment:
     skills: list[str] = field(default_factory=list)
     seniority: Seniority | None = None
     category: Category | None = None
+    countries: list[str] = field(default_factory=list)
+    remote_countries: list[str] = field(default_factory=list)

@@ -104,7 +104,7 @@ def enrich_jobs(conn: sqlite3.Connection, force: bool = False) -> int:
             for row, input_hash in todo
         ]
         db.save_enrichments(conn, rules.METHOD, rules.VERSION, results)
-        for field_name in ("work_type", "seniority", "category", "min_loe", "salary", "visa", "skills"):
+        for field_name in ("work_type", "seniority", "category", "min_loe", "salary", "visa", "skills", "countries"):
             filled = sum(1 for _, _, e in results if getattr(e, field_name))
             log.info("  %-10s found for %6d of %d", field_name, filled, len(results))
     else:

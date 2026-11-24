@@ -66,7 +66,7 @@ def _to_job(raw: dict, company: str, description: str, contacts: dict[str, str])
         work_type="remote" if "remote" in location.lower() else None,
         min_loe=_min_years(raw.get("minExperience") or ""),
         skills=[
-            s["name"] if isinstance(s, dict) else str(s)
+            (s["name"] if isinstance(s, dict) else str(s)).lower()
             for s in raw.get("skills") or []
         ],
         salary=raw.get("salaryRange") or None,

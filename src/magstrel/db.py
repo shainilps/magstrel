@@ -5,6 +5,7 @@ import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from magstrel.enrich import location as places
 from magstrel.models import Company, Enrichment, Job, ScrapeTarget, SearchQuery
 from magstrel.utils import to_iso
 
@@ -276,19 +277,21 @@ def save_enrichments(
             """
             INSERT INTO job_enrichment (
                 job_id, method, version, input_hash, enriched_at, work_type, min_loe,
-                max_loe, salary, visa, skills, seniority, category
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                max_loe, salary, visa, skills, seniority, category, countries, remote_countries
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (job_id, method) DO UPDATE SET
                 version = excluded.version, input_hash = excluded.input_hash,
                 enriched_at = excluded.enriched_at, work_type = excluded.work_type,
                 min_loe = excluded.min_loe, max_loe = excluded.max_loe,
                 salary = excluded.salary, visa = excluded.visa, skills = excluded.skills,
-                seniority = excluded.seniority, category = excluded.category
+                seniority = excluded.seniority, category = excluded.category,
+                countries = excluded.countries, remote_countries = excluded.remote_countries
             """,
             [
                 (
                     job_id, method, version, input_hash, now, e.work_type, e.min_loe,
                     e.max_loe, e.salary, e.visa, json.dumps(e.skills), e.seniority, e.category,
+                    json.dumps(e.countries), json.dumps(e.remote_countries),
                 )
                 for job_id, input_hash, e in results
             ],
@@ -315,8 +318,29 @@ def search_jobs(conn: sqlite3.Connection, query: SearchQuery) -> list[sqlite3.Ro
         where.append("c.name LIKE ?")
         params.append(f"%{query.company}%")
     if query.location:
-        where.append("j.location LIKE ?")
-        params.append(f"%{query.location}%")
+        # "India" also finds "IN / Remote (IN)" and "Bengaluru", which never spell it out
+        code = places.country_code(query.location)
+        if code:
+            where.append(
+                "(j.location LIKE ? OR EXISTS (SELECT 1 FROM json_each(j.countries) WHERE value = ?))"
+            )
+            params += [f"%{query.location}%", code]
+        else:
+            where.append("j.location LIKE ?")
+            params.append(f"%{query.location}%")
+    order_params: list[object] = []
+    explicit = ""
+    if query.remote_from:
+        code = places.country_code(query.remote_from)
+        if code is None:
+            raise ValueError(f"unknown country {query.remote_from!r}, try a name or code like India or in")
+        allowed = places.open_to(code)
+        marks = ", ".join("?" * len(allowed))
+        explicit = f"EXISTS (SELECT 1 FROM json_each(j.remote_countries) WHERE value IN ({marks}))"
+        # plain "Remote" says nowhere: kept, but listed after the jobs that name your country
+        where.append(f"j.work_type = 'remote' AND (j.remote_countries = '[]' OR {explicit})")
+        params += allowed
+        order_params = list(allowed)
     if query.max_employees is not None:
         where.append("c.employees_max <= ?")
         params.append(query.max_employees)
@@ -327,7 +351,7 @@ def search_jobs(conn: sqlite3.Connection, query: SearchQuery) -> list[sqlite3.Ro
         where.append("j.category = ?")
         params.append(query.category)
     if query.skill:
-        where.append("EXISTS (SELECT 1 FROM json_each(j.skills) WHERE value = ?)")
+        where.append("EXISTS (SELECT 1 FROM json_each(j.skills) WHERE lower(value) = ?)")
         params.append(query.skill.lower())
     if query.years is not None:
         # jobs you qualify for: no stated requirement, or one you meet
@@ -355,10 +379,12 @@ def search_jobs(conn: sqlite3.Connection, query: SearchQuery) -> list[sqlite3.Ro
         sql += " JOIN jobs_fts ON jobs_fts.rowid = j.id"
     if where:
         sql += " WHERE " + " AND ".join(where)
+    sql += f" ORDER BY {explicit} DESC," if explicit else " ORDER BY"
+    params += order_params
     if query.terms:
-        sql += " ORDER BY bm25(jobs_fts, 10.0, 5.0, 2.0, 1.0)"
+        sql += " bm25(jobs_fts, 10.0, 5.0, 2.0, 1.0)"
     else:
-        sql += " ORDER BY COALESCE(j.published, j.first_seen) DESC"
+        sql += " COALESCE(j.published, j.first_seen) DESC"
     sql += " LIMIT ?"
     params.append(query.limit)
 

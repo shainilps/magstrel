@@ -2,6 +2,7 @@ import pytest
 
 from magstrel.enrich.category import category
 from magstrel.enrich.experience import years
+from magstrel.enrich.location import countries, country_code, open_to
 from magstrel.enrich.salary import salary
 from magstrel.enrich.seniority import seniority
 from magstrel.enrich.skills import skills
@@ -140,3 +141,52 @@ def test_visa(text, expected):
 )
 def test_skills(title, text, expected):
     assert skills(title, text) == expected
+
+
+@pytest.mark.parametrize(
+    ("location", "everywhere", "remote"),
+    [
+        ("IN / Remote (IN)", ["in"], ["in"]),
+        ("Bengaluru, KA, IN / Bengaluru, Karnataka, IN", ["in"], ["in"]),
+        ("Bengaluru, India", ["in"], ["in"]),
+        ("Indianapolis, IN", ["us"], ["us"]),
+        ("San Francisco, CA", ["us"], ["us"]),
+        ("US / CA / Remote (US; CA)", ["ca", "us"], ["ca", "us"]),
+        ("Cupertino, CA, US / Remote (CA, US; GA, US)", ["us"], ["us"]),
+        ("Remote - CA; Remote - TX", ["us"], ["us"]),
+        ("Remote - USA", ["us"], ["us"]),
+        ("Remote U.S.", ["us"], ["us"]),
+        ("Remote, Canada; Remote, India; Remote, United States", ["ca", "in", "us"], ["ca", "in", "us"]),
+        ("Remote - APAC", ["apac"], ["apac"]),
+        ("REMOTE (Worldwide)", ["anywhere"], ["anywhere"]),
+        ("Remote (EU)", ["europe"], ["europe"]),
+        ("Bengaluru, India / Remote (US)", ["in", "us"], ["us"]),
+        ("San Francisco, CA, US / London, England, GB / Remote", ["gb", "us"], ["gb", "us"]),
+        ("Remote / USA", ["us"], ["us"]),
+        ("Remote - NYC", ["us"], ["us"]),
+        ("NAMER", ["north-america"], ["north-america"]),
+        ("Remote - Washington D.C.; Washington, D.C.", ["us"], ["us"]),
+        ("Remote", [], []),
+        ("Canada - Remote (ON, AB, BC, or NS Only)", ["ca"], ["ca"]),
+        ("REMOTE (US, Canada)", ["ca", "us"], ["ca", "us"]),
+        ("San Francisco HYBRID (3 days/wk) or REMOTE (US)", ["us"], ["us"]),
+    ],
+)
+def test_countries(location, everywhere, remote):
+    assert countries(location) == (everywhere, remote)
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [("India", "in"), ("in", "in"), ("UK", "gb"), ("United States", "us"), ("APAC", "apac"), ("London", None)],
+)
+def test_country_code(text, expected):
+    assert country_code(text) == expected
+
+
+def test_open_to_india_includes_its_regions():
+    assert open_to("in") == ["anywhere", "apac", "in"]
+
+
+def test_countries_handles_turkish_dotted_i():
+    assert countries("İstanbul, Türkiye") == (["tr"], ["tr"])

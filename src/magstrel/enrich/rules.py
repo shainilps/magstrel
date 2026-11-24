@@ -2,6 +2,7 @@ import hashlib
 
 from magstrel.enrich.category import category
 from magstrel.enrich.experience import years
+from magstrel.enrich.location import countries
 from magstrel.enrich.salary import salary
 from magstrel.enrich.seniority import seniority
 from magstrel.enrich.skills import skills
@@ -11,11 +12,12 @@ from magstrel.models import Enrichment
 
 METHOD = "rules"
 # bump this whenever a rule changes: `magstrel enrich` then redoes every job
-VERSION = 1
+VERSION = 2
 
 
 def enrich(title: str, location: str, description: str) -> Enrichment:
     min_loe, max_loe = years(description)
+    places, remote_places = countries(location)
     return Enrichment(
         work_type=work_type(title, location, description),
         min_loe=min_loe,
@@ -25,6 +27,8 @@ def enrich(title: str, location: str, description: str) -> Enrichment:
         skills=skills(title, description),
         seniority=seniority(title),
         category=category(title),
+        countries=places,
+        remote_countries=remote_places,
     )
 
 

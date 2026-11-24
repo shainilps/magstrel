@@ -149,6 +149,9 @@ def main() -> None:
     search.add_argument("--category", choices=get_args(Category))
     search.add_argument("--skill", help="e.g. python, rust, kubernetes")
     search.add_argument(
+        "--remote-from", help="your country, e.g. India: remote jobs you can take from there"
+    )
+    search.add_argument(
         "--years", type=int, help="your years of experience: hide jobs asking for more"
     )
     search.add_argument(
@@ -401,12 +404,13 @@ def cmd_search(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
         skill=args.skill,
         years=args.years,
         days=args.days,
+        remote_from=args.remote_from,
         include_closed=args.closed,
         limit=args.limit,
     )
     try:
         rows = db.search_jobs(conn, query)
-    except sqlite3.OperationalError as err:
+    except (sqlite3.OperationalError, ValueError) as err:
         sys.exit(f"bad search: {err}")
     if not rows:
         print("no jobs found")
